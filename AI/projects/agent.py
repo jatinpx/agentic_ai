@@ -1,8 +1,12 @@
 import ollama
 import json
+from memory import store_memory, recall_memory
+from planner import create_plan
+from critic import review_answer
 
 
-def calcullator(expression: str):
+
+def calculator(expression: str):
     try:
         return str(eval(expression))
     except:
@@ -20,7 +24,7 @@ def web_search(query: str):
 
 
 TOOLS={
-    "calcullator":calcullator,
+    "calculator":calculator,
     "search":web_search,
     "save":save_to_file
 }
@@ -55,30 +59,95 @@ If no tool needed:
 
 
 def run_agent(user_input):
-    response=ollama.chat(
-    model='phi3',
-    messages=[{"role":"system", "content":SYSTEM_PROMPT},
-              {"role":'user', "content": user_input}
-              ]
+
+    past = recall_memory(user_input)
+    context = f"Past interactions:\n{past}\n\nCurrent query:\n{user_input}"
+
+    response = ollama.chat(
+        model='phi3',
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": context}
+        ]
     )
-    
-    content= response["message"]["content"]
-    
+
+    import re
+    content = response["message"]["content"].strip()
+
+    # extract JSON safely
+    match = re.search(r'\{[^{}]*\}', content, re.DOTALL)
+    if not match:
+        return f"Could not find JSON in:\n{content}"
+
+    json_text = match.group(0)
+
     try:
-        data=json.loads(content)
-    except:
-        return f"LLM formatting error:\n{content}"
-    
-    tool =data,get("tool")
-    
-    if(tool)=="none":
-        return data.get("response")
-    
+        data = json.loads(json_text)
+    except Exception as e:
+        return f"JSON parse error: {e}\nExtracted:\n{json_text}"
+
+    tool = data.get("tool", "").lower().strip()
+
+    # normalize tool names
+    if tool in ["math", "calc"]:
+        tool = "calculator"
+    if tool in ["write", "save_file"]:
+        tool = "save"
+    if tool in ["google", "web"]:
+        tool = "search"
+
+    # ---------------- NO TOOL CASE ---------------- #
+    if tool == "none":
+        reply = data.get("response", "")
+
+        # reflection check
+        verdict = review_answer(user_input, reply)
+
+        if "IMPROVE" in verdict:
+            improved = ollama.chat(
+                model="phi3",
+                messages=[
+                    {"role": "system", "content": "Improve this answer and make it more helpful."},
+                    {"role": "user", "content": reply}
+                ]
+            )
+            reply = improved["message"]["content"]
+
+        store_memory(f"User: {user_input}\nAgent: {reply}")
+        return reply
+
+    # ---------------- TOOL CASE ---------------- #
     if tool in TOOLS:
-        result=TOOLS[tool](date.get("input", ""))
-        return f"[Tool {tool} used]\nResults:{result}"
-    
-    return "unknown tool"
+        result = TOOLS[tool](data.get("input", ""))
+
+        # reflection check
+        verdict = review_answer(user_input, result)
+
+        if "IMPROVE" in verdict:
+            improved = ollama.chat(
+                model="phi3",
+                messages=[
+                    {"role": "system", "content": "Improve this answer and make it more useful."},
+                    {"role": "user", "content": result}
+                ]
+            )
+            result = improved["message"]["content"]
+
+        store_memory(f"User: {user_input}\nAgent used {tool} got result {result}")
+        return f"[Tool {tool} used]\nResults: {result}"
+
+    # ---------------- FALLBACK ---------------- #
+    fallback = ollama.chat(
+        model="phi3",
+        messages=[
+            {"role": "system", "content": "You are a helpful AI assistant."},
+            {"role": "user", "content": user_input}
+        ]
+    )
+
+    reply = fallback["message"]["content"]
+    store_memory(f"User: {user_input}\nAgent: {reply}")
+    return reply
 
 
 #loop
@@ -91,5 +160,27 @@ if __name__ == "__main__":
         if user.lower() == "exit":
             break
 
-        output = run_agent(user)
-        print("Agent:", output)
+        # create plan
+        steps = create_plan(user)
+
+        if steps:
+            print("\n🧠 Plan:")
+            for i, step in enumerate(steps, 1):
+                print(f"{i}. {step}")
+
+            print("\n⚡ Executing...\n")
+
+            for step in steps:
+    
+    # if step is dict, convert to string
+                if isinstance(step, dict):
+                    step = list(step.values())[0]
+
+                print(f"\n⚙️ Executing step: {step}\n")
+                output = run_agent(step)
+                print("→", output)
+
+
+        else:
+            output = run_agent(user)
+            print("Agent:", output)
