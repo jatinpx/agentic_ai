@@ -1,6 +1,5 @@
 import re
 import uuid
-import ollama
 from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -8,6 +7,7 @@ from tools.registry import get_tool, list_tools
 from tools.registry import execute_tool, list_available_tools
 from services.memory_service import store_memory, recall_memory
 from services.memory_picker import pick_memory_for_role
+from services.llm_client import chat
 
 
 # --- OPTIONAL: Mock logger if brain.logger is not present ---
@@ -96,12 +96,10 @@ EXAMPLE:
 4. Format final answer | TOOL: NONE
 """
 
-    response = ollama.chat(
-        model="deepseek-r1:7b",
-        messages=[{"role": "user", "content": prompt}]
+    raw_text = chat(
+        messages=[{"role": "user", "content": prompt}],
+        model="deepseek-r1:7b"
     )
-
-    raw_text = response["message"]["content"]
 
     # remove thinking blocks
     raw_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
@@ -213,12 +211,10 @@ TOOL: tool_name or NONE
 INPUT: exact input for tool
 """
 
-    response = ollama.chat(
-        model="qwen2.5:7b-instruct",
-        messages=[{"role": "user", "content": prompt}]
+    text = chat(
+        messages=[{"role": "user", "content": prompt}],
+        model="qwen2.5:7b-instruct"
     )
-
-    text = response["message"]["content"]
 
     tool = "NONE"
     tool_input = step_text
@@ -235,9 +231,6 @@ INPUT: exact input for tool
 
     return tool, tool_input
 
-
-import re
-import ollama
 from tools.registry import get_tool # Ensure this is your actual tool loader
 
 def executor_node(state: AgentState):
@@ -315,12 +308,10 @@ def executor_node(state: AgentState):
             "INSTRUCTION: Use the context provided to complete this task accurately."
         )
 
-        response = ollama.chat(
-            model="qwen2.5:7b-instruct",
-            messages=[{"role": "user", "content": prompt}]
+        llm_output = chat(
+            messages=[{"role": "user", "content": prompt}],
+            model="qwen2.5:7b-instruct"
         )
-
-        llm_output = response["message"]["content"]
         results.append(llm_output)
         context += f"\n[REASONING] {llm_output}\n"
 
@@ -342,10 +333,10 @@ def executor_node(state: AgentState):
         - important decisions
         """
 
-    summary = ollama.chat(
-        model="qwen2.5:7b-instruct",
-        messages=[{"role": "user", "content": summary_prompt}]
-    )["message"]["content"]
+    summary = chat(
+        messages=[{"role": "user", "content": summary_prompt}],
+        model="qwen2.5:7b-instruct"
+    )
     
     # avoid storing useless or duplicate memory
     clean_summary = summary.strip()
@@ -433,14 +424,14 @@ def critic_node(state: AgentState):
         f"Feedback: [One clear sentence on what to fix if FAIL]"
     )
 
-    response = ollama.chat(
-        model="deepseek-r1:7b",
-        messages=[{"role": "user", "content": prompt}]
+    response = chat(
+        messages=[{"role": "user", "content": prompt}],
+        model="deepseek-r1:7b"
     )
 
     # 4. Clean and Parse Response
     # DeepSeek-R1 often includes <think> tags. We want the final verdict.
-    raw_content = response["message"]["content"]
+    raw_content = response
     
     # Remove thinking traces for cleaner logging (optional, but good for parsing)
     clean_content = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL).strip()
@@ -482,14 +473,14 @@ def improve_node(state: AgentState):
 
     prompt = f"Format and polish this into a professional final report:\n{combined}"
 
-    response = ollama.chat(
-        model="qwen2.5:7b-instruct",
-        messages=[{"role": "user", "content": prompt}]
+    response = chat(
+        messages=[{"role": "user", "content": prompt}],
+        model="qwen2.5:7b-instruct"
     )
 
     print("✨ Report finalized.")
     log_event("improve", "init", "Report finalized.")
-    return {"final_answer": response["message"]["content"]}
+    return {"final_answer": response}
 
 # ==========================================
 # 3. GRAPH CONSTRUCTION

@@ -1,6 +1,7 @@
-import ollama
 import json
 import re
+
+from services.llm_client import chat
 
 PLANNER_PROMPT = """
 Break the user request into simple steps.
@@ -17,15 +18,13 @@ Return ONLY valid JSON:
 
 def create_plan(user_goal):
 
-    response = ollama.chat(
-        model="phi3",
+    content = chat(
         messages=[
             {"role": "system", "content": PLANNER_PROMPT},
             {"role": "user", "content": user_goal}
-        ]
+        ],
+        model="phi3"
     )
-
-    content = response["message"]["content"]
 
     # extract json safely
     match = re.search(r'\{.*\}', content, re.DOTALL)

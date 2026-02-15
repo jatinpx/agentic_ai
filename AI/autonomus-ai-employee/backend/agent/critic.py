@@ -1,4 +1,4 @@
-import ollama
+from services.llm_client import chat
 
 CRITIC_PROMPT = """
 You are a strict AI critic.
@@ -16,12 +16,10 @@ IMPROVE
 
 def review_answer(task, answer):
 
-    response = ollama.chat(
-        model="phi3",
+    return chat(
         messages=[
             {"role": "system", "content": CRITIC_PROMPT},
             {"role": "user", "content": f"Task: {task}\nAnswer: {answer}"}
-        ]
-    )
-
-    return response["message"]["content"].strip()
+        ],
+        model="phi3"
+    ).strip()

@@ -1,4 +1,3 @@
-import ollama
 import json
 import re
 
@@ -6,6 +5,7 @@ from agent.memory import store_memory, recall_memory
 from agent.critic import review_answer
 from tools.search import web_search
 from tools.file_tools import save_to_file
+from services.llm_client import chat
 
 def calculator(expression: str):
     try:
@@ -38,15 +38,13 @@ def run_agent(user_input):
     past = recall_memory(user_input)
     context = f"Past memory:\n{past}\n\nUser:{user_input}"
 
-    response = ollama.chat(
-        model="phi3",
+    content = chat(
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": context}
-        ]
-    )
-
-    content = response["message"]["content"].strip()
+        ],
+        model="phi3"
+    ).strip()
     match = re.search(r'\{[^{}]*\}', content)
 
     if not match:
@@ -60,13 +58,12 @@ def run_agent(user_input):
 
         verdict = review_answer(user_input, reply)
         if "IMPROVE" in verdict:
-            improved = ollama.chat(
-                model="phi3",
+            reply = chat(
                 messages=[
-                    {"role":"user","content":f"Improve:\n{reply}"}
-                ]
+                    {"role": "user", "content": f"Improve:\n{reply}"}
+                ],
+                model="phi3"
             )
-            reply = improved["message"]["content"]
 
         store_memory(f"{user_input} -> {reply}")
         return reply
@@ -76,13 +73,12 @@ def run_agent(user_input):
 
         verdict = review_answer(user_input, result)
         if "IMPROVE" in verdict:
-            improved = ollama.chat(
-                model="phi3",
+            result = chat(
                 messages=[
-                    {"role":"user","content":f"Improve:\n{result}"}
-                ]
+                    {"role": "user", "content": f"Improve:\n{result}"}
+                ],
+                model="phi3"
             )
-            result = improved["message"]["content"]
 
         store_memory(f"{user_input} -> {result}")
         return result

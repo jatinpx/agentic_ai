@@ -1,4 +1,4 @@
-import ollama
+from services.llm_client import chat
 
 def pick_memory_for_role(query: str, memories: list[str], role: str, k: int = 2):
     """
@@ -30,10 +30,10 @@ Return ONLY memory numbers.
 Example: 1,3
 """
 
-    res = ollama.chat(
-        model="qwen2.5:7b-instruct",
-        messages=[{"role": "user", "content": prompt}]
-    )["message"]["content"]
+    res = chat(
+        messages=[{"role": "user", "content": prompt}],
+        model="qwen2.5:7b-instruct"
+    )
 
     nums = []
     for p in res.replace(" ", "").split(","):
