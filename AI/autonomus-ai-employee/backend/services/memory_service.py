@@ -9,4 +9,7 @@ def store_memory(content: str, mem_type="general", task_id=None):
 
 def recall_memory(query: str, limit=5):
     emb = embed_text(query)
-    return search_memory(emb, limit)
+    results = search_memory(emb, limit)
+    # The search_memory returns [(content, distance), ...]
+    # We only want the 'content' string for the picker.
+    return [r[0] for r in results if r[0] is not None]

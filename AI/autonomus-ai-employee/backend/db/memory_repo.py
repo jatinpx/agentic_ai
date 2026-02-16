@@ -30,9 +30,9 @@ def search_memory(embedding, limit=5):
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT content
+        SELECT content,(embedding <-> %s::vector) AS distance
         FROM agent_memory
-        ORDER BY embedding <-> %s::vector
+        ORDER BY distance ASC
         LIMIT %s
         """, (embedding, limit))
 
@@ -41,4 +41,4 @@ def search_memory(embedding, limit=5):
     cur.close()
     conn.close()
 
-    return [r[0] for r in rows]
+    return [(r[0], r[1]) for r in rows]

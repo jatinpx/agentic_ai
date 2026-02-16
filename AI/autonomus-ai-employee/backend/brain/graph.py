@@ -20,6 +20,15 @@ def log_event(stage: str, step_id: str, message: str):
     add_log(f"[STAGE:{stage}] [STEP:{step_id}] {message}")
 
 # ==========================================
+# MODEL CONFIGURATION PER NODE
+# ==========================================
+# Configure the ollama model for each node
+MODEL_PLANNER = "llama3.1:latest" # You can adjust this to a more powerful model if available
+MODEL_EXECUTOR = "llama3.1:latest"
+MODEL_CRITIC = "llama3.1:latest" # You can adjust this to a more powerful model if available
+MODEL_IMPROVER = "llama3.1:latest" # You can adjust this to a more powerful model if available
+
+# ==========================================
 # 1. STATE DEFINITION
 # ==========================================
 class AgentState(TypedDict):
@@ -37,122 +46,94 @@ class AgentState(TypedDict):
 # ==========================================
 
 def planner_node(state: AgentState):
-    """
-    High-discipline planning node.
-    Produces deterministic, tool-aware execution plans.
-    """
-
     user_input = state["user_input"]
     iteration = state.get("iteration_count", 0) + 1
     
-    raw_mem = recall_memory(user_input, limit=8)
-    picked = pick_memory_for_role(user_input, raw_mem, role="planner", k=2)
-    memo = "\n".join(picked)
+    feedback = state.get("critique_feedback", "")
+    is_replan = iteration > 1
 
+    # 1. Fetch raw memories (list of tuples)
+    raw_mem_tuples = recall_memory(user_input, limit=8)
     
-    print("\n🧠Memory Retrieved:")
-    for m in memo.split("\n"):
-        print(f"- {m[:150]}...")  # Print a snippet of each memory for debugging
+    # 2. Extract just the strings for the picker
+    raw_mem_strings = [m[0] for m in raw_mem_tuples if m[0]]
+    
+    # 3. Pick the best ones (Returns List[str])
+    picked = pick_memory_for_role(user_input, raw_mem_strings, role="planner", k=3)
+    
+    # FIX: 'picked' is now just a list of strings
+    memo = "\n".join([f"- {m}" for m in picked])
 
+    print(f"\n🧠 [PLANNER] Iteration {iteration} | Re-planning: {is_replan}")
+    # ... rest of node ...
+    if is_replan:
+        print(f"❌ Previous Feedback: {feedback}")
 
-    print("\n🧠 [PLANNER] Strategizing with Tool Awareness...")
-    log_event("planner", "init", "Creating strategic plan.")
+    # 3. Dynamic Prompt Construction
+    # We add a specific section for "CRITIQUE" if we are in a loop
+    critique_section = f"\n### ❌ FEEDBACK FROM PREVIOUS ATTEMPT:\n{feedback}\nYOU MUST ADDRESS THIS FEEDBACK IN YOUR NEW PLAN." if is_replan else ""
 
-    # =========================
-    # STRICT PLANNER PROMPT
-    # =========================
     prompt = f"""
-You are a senior autonomous AI planner.
+You are a senior autonomous AI planner. Your goal is to provide a plan that is highly specific, technical, and avoids generic summaries.
 
-RELEVANT PAST EXPERIENCE (Use this to avoid repeating work and improve planning):
+{critique_section}
+
+RELEVANT PAST EXPERIENCE:
 {memo}
-User goal:
+
+USER GOAL:
 {user_input}
 
-Available tools:
-- web_search  → use for internet or latest factual info
-- python_exec → use for calculations, parsing, data extraction, structuring
-- NONE        → use for reasoning, comparison, writing
+AVAILABLE TOOLS:
+- web_search  → Use for specific technical data, newest facts, and detailed specs.
+- python_exec → Use for data processing, math, or structuring logic.
+- NONE        → Use for final reasoning and synthesis.
 
-Your job:
-Create a precise execution plan.
-
-STRICT RULES:
+STRICT PLANNING RULES:
 1. Output ONLY numbered steps.
 2. Each step MUST end with: | TOOL: tool_name
-3. Allowed tools ONLY: web_search, python_exec, NONE
-4. NEVER mention tool inside step text.
-5. If getting info → web_search
-6. If extracting/calculating → python_exec
-7. If analyzing/writing → NONE
-8. No intro text
-9. No markdown
-10. Max 5 steps
+3. If the previous attempt was "too generic", break your search steps into specific sub-topics (e.g., instead of "Search AI", use "Search for Agentic AI memory architectures and tool-use patterns").
+4. Ensure the plan includes a specific step for "Checking for technical details" to satisfy a strict critic.
+5. Max 5 steps. No intro/outro.
 
-EXAMPLE:
-1. Search latest Nvidia GPU prices | TOOL: web_search
-2. Extract price numbers from results | TOOL: python_exec
-3. Compare models | TOOL: NONE
-4. Format final answer | TOOL: NONE
+EXAMPLE OF SPECIFIC PLANNING:
+1. Search for specific technical architectures of {user_input} | TOOL: web_search
+2. Look for real-world case studies and industry-specific metrics | TOOL: web_search
+3. Synthesize technical specs into a detailed report | TOOL: NONE
 """
 
     raw_text = chat(
         messages=[{"role": "user", "content": prompt}],
-        model="deepseek-r1:7b"
+        model=MODEL_PLANNER
     )
 
-    # remove thinking blocks
+    # --- Standard Cleaning Logic ---
     raw_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
-
     lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
     parsed_steps = []
 
-    # =========================
-    # CLEAN PARSING
-    # =========================
     for line in lines:
-
-        # accept numbered lines only
-        if not re.match(r"^\d+[\.\)]", line):
-            continue
-
-        # remove leading number formatting
+        if not re.match(r"^\d+[\.\)]", line): continue
         step_body = re.sub(r"^\d+[\.\)]\s*", "", line).strip()
-
-        # check tool tag
         tool_match = re.search(r"\|\s*TOOL\s*:\s*(\w+)", step_body, re.IGNORECASE)
-
+        
         if tool_match:
             tool_name = tool_match.group(1).lower()
             step_text = re.sub(r"\|\s*TOOL\s*:\s*\w+", "", step_body, flags=re.IGNORECASE).strip()
         else:
             tool_name = "none"
             step_text = step_body
-
-        # safety: restrict tools
-        if tool_name not in ["web_search", "python_exec", "none"]:
-            tool_name = "none"
-
+        
+        if tool_name not in ["web_search", "python_exec", "none"]: tool_name = "none"
         parsed_steps.append(f"{step_text} | TOOL: {tool_name}")
 
-    # =========================
-    # FALLBACK if model fails
-    # =========================
     if not parsed_steps:
-        parsed_steps = [
-            f"Search information related to {user_input} | TOOL: web_search",
-            "Analyze gathered information | TOOL: NONE",
-            "Prepare final structured response | TOOL: NONE"
-        ]
+        parsed_steps = [f"Search for deep technical details on {user_input} | TOOL: web_search", "Analyze findings | TOOL: NONE"]
 
-    # limit steps
-    parsed_steps = parsed_steps[:5]
-
-    print(f"🧠 Strategic Plan: {parsed_steps}")
-    log_event("planner", "init", f"Plan created with {len(parsed_steps)} steps.")
+    log_event("planner", f"iter-{iteration}", f"Plan created. Addressing feedback: {is_replan}")
 
     return {
-        "plan": parsed_steps,
+        "plan": parsed_steps[:5],
         "results": [],
         "iteration_count": iteration
     }
@@ -213,7 +194,7 @@ INPUT: exact input for tool
 
     text = chat(
         messages=[{"role": "user", "content": prompt}],
-        model="qwen2.5:7b-instruct"
+        model=MODEL_EXECUTOR
     )
 
     tool = "NONE"
@@ -238,13 +219,22 @@ def executor_node(state: AgentState):
     results = []
     context = ""
     
-    # 🔍 recall memory for execution context
-    raw_mem = recall_memory(state["user_input"], limit=6)
-    picked = pick_memory_for_role(state["user_input"], raw_mem, role="executor", k=2)
-    context += "\n".join(picked)
+    # 1. Fetch raw tuples
+    raw_mem_tuples = recall_memory(state["user_input"], limit=6)
+    
+    # 2. Convert to strings for the picker
+    raw_mem_strings = [m[0] for m in raw_mem_tuples if m[0]]
+    
+    # 3. Pick best (Returns List[str])
+    picked = pick_memory_for_role(state["user_input"], raw_mem_strings, role="executor", k=2)
+    
     print("\n🧠 [EXECUTOR MEMORY PICKED]:")
-    for m in picked:
-        print("-", m[:120])
+    for content in picked:
+        # FIX: content is a string, no distance available here
+        print(f"- {content[:120]}...")
+        context += f"\n[PAST EXPERIENCE] {content}\n"
+
+    # ... rest of node ...
 
 
 
@@ -310,7 +300,7 @@ def executor_node(state: AgentState):
 
         llm_output = chat(
             messages=[{"role": "user", "content": prompt}],
-            model="qwen2.5:7b-instruct"
+            model=MODEL_EXECUTOR
         )
         results.append(llm_output)
         context += f"\n[REASONING] {llm_output}\n"
@@ -335,23 +325,35 @@ def executor_node(state: AgentState):
 
     summary = chat(
         messages=[{"role": "user", "content": summary_prompt}],
-        model="qwen2.5:7b-instruct"
+        model=MODEL_EXECUTOR
     )
     
     # avoid storing useless or duplicate memory
     clean_summary = summary.strip()
 
-    if len(clean_summary) > 60:  # ignore weak runs
+    # ... inside executor_node ...
+    if len(clean_summary) > 60:
+        # Search for the 1 most similar memory
         existing = recall_memory(clean_summary, limit=1)
+        
+        should_save = True
+        if existing:
+            content, distance = existing[0]
+            print(f"📊 [MEMORY CHECK] Closest match distance: {distance:.4f}")
+            
+            # If distance is very small, it's a duplicate.
+            # Adjust 0.1 based on your specific embedding model's sensitivity.
+            if distance < 0.1:
+                print("⚠️ [SKIP] Similar experience already exists in memory.")
+                should_save = False
 
-        # only store if not semantically similar memory exists
-        if not existing:
+        if should_save:
             store_memory(
                 content=clean_summary,
                 mem_type="experience",
                 task_id=str(uuid.uuid4())
             )
-            print("\n🧠 MEMORY STORED:", clean_summary[:120])
+            print("\n🧠 [MEMORY STORED]:", clean_summary[:120])
 
 
         
@@ -360,127 +362,157 @@ def executor_node(state: AgentState):
 
 def critic_node(state: AgentState):
     """
-    Critic reviews output for accuracy, relevance and hallucinations.
-    Uses past failure memory to improve judgement.
-    """
-
-    print("🧪 [CRITIC] Reviewing work...")
-    log_event("critic", "init", "Reviewing results for relevance and accuracy.")
-
-    # ---------------------------------------------------
-    # 1. GET USER QUERY
-    # ---------------------------------------------------
-    user_query = state.get("user_input", "Unknown query")
-
-    # ---------------------------------------------------
-    # 2. RETRIEVE MEMORY FROM DB
-    # ---------------------------------------------------
-    raw_memories = recall_memory(user_query, limit=8)
-
-    # ---------------------------------------------------
-    # 3. PICK ONLY FAILURE / LEARNING MEMORIES
-    # ---------------------------------------------------
-    try:
-        from services.memory_picker import pick_memory_for_role
-
-        selected_memories = pick_memory_for_role(
-            query=user_query,
-            memories=raw_memories,
-            role="critic",
-            k=2
-        )
-    except Exception:
-        # fallback if picker fails
-        selected_memories = raw_memories[:2]
-
-    # ---------------------------------------------------
-    # 4. BUILD FAILURE CONTEXT
-    # ---------------------------------------------------
-    failure_context = "\n".join(selected_memories) if selected_memories else "None"
-
-    # debug visibility
-    print("\n🧠 [CRITIC MEMORY USED]:")
-    for m in selected_memories:
-        print("-", m[:150])
-
-    # ---------------------------------------------------
-    # 5. COMBINE CURRENT RESULTS
-    # ---------------------------------------------------
-    combined = "\n".join(state.get("results", []))
+    Constructive Critic Node.
+    Forces specific, actionable feedback and prevents vague 'refine' loops.
     
-    # 3. Enhanced Prompt
-    prompt = (
-        f"You are a strict technical Editor. Review the content below based on the User Query.\n\n"
-        f"### USER QUERY: '{user_query}'\n\n"
-        f"### CONTENT TO REVIEW:\n{combined}\n\n"
-        f"### PAST MISTAKES or FAILURES (if any):\n{failure_context}\n\n"
-        f"### INSTRUCTIONS:\n"
-        f"1. **Relevance**: Does this directly answer the specific user query? (Ignore generic intros like 'Executive Summary').\n"
-        f"2. **Accuracy**: Are there actual numbers/specs? Flag any code that uses 'Hypothetical' or 'Example' values.\n"
-        f"3. **Completeness**: Is important info missing?\n\n"
-        f"### FORMAT (Strictly follow this):\n"
-        f"Thinking: [Brief reasoning]\n"
-        f"Status: [PASS] or [FAIL]\n"
-        f"Feedback: [One clear sentence on what to fix if FAIL]"
-    )
+    :param state: Description
+    :type state: AgentState
+    """
+    print("🧪 [CRITIC] Reviewing work...")
+    user_query = state.get("user_input", "Unknown query")
+    iteration = state.get("iteration_count", 1)
+    
+    # 1. Fetch raw tuples
+    raw_memories_tuples = recall_memory(user_query, limit=5)
+    
+    # 2. Extract strings
+    raw_mem_strings = [m[0] for m in raw_memories_tuples if m[0]]
+    
+    # 3. Pick (Returns List[str])
+    selected_memories = pick_memory_for_role(user_query, raw_mem_strings, role="critic", k=2)
+    
+    # FIX: selected_memories is List[str]
+    failure_context = "\n".join([m for m in selected_memories]) if selected_memories else "None"
+    
+    # ... rest of node ...
+
+    # 2. Results to Review
+    combined_results = "\n".join(state.get("results", []))
+
+    # 3. Constructive Prompt
+    # We tell the Critic to be more lenient if we've already tried 3 times.
+    strictness = "high" if iteration < 3 else "moderate"
+
+    prompt = f"""
+            You are a Technical Quality Auditor (Strictness: {strictness}).
+            Review the content below against the User Query.
+
+            ### USER QUERY: 
+            '{user_query}'
+
+            ### CONTENT TO REVIEW:
+            {combined_results}
+
+            ### PAST MISTAKES TO WATCH FOR:
+            {failure_context}
+
+            ### CRITICAL RULES:
+            1. **Actionable Feedback**: If you FAIL the content, you MUST specify exactly what is missing (e.g., "Missing current market cap for Nvidia" instead of "Refine results").
+            2. **The 80/20 Rule**: If the content is factually correct and answers the main prompt, lean towards [PASS]. Do not fail for minor stylistic choices.
+            3. **No Hallucinations**: If the agent used phrases like "I don't have real-time data" or "Placeholder", it MUST [FAIL].
+            4. **Specificity**: Check for actual numbers, dates, and names.
+
+            ### FORMAT:
+            Thinking: [Your reasoning]
+            Status: [PASS] or [FAIL]
+            Feedback: [If FAIL: One specific instruction for the planner. If PASS: "Excellent work."]
+            """
 
     response = chat(
         messages=[{"role": "user", "content": prompt}],
-        model="deepseek-r1:7b"
+        model=MODEL_CRITIC
     )
 
-    # 4. Clean and Parse Response
-    # DeepSeek-R1 often includes <think> tags. We want the final verdict.
-    raw_content = response
+    # 4. Cleaning & Parsing
+    clean_content = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
     
-    # Remove thinking traces for cleaner logging (optional, but good for parsing)
-    clean_content = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL).strip()
+    # Robust Status Detection
+    status = "FAIL" if "Status: [FAIL]" in clean_content or "STATUS: FAIL" in clean_content.upper() else "PASS"
     
-    # Robust status detection
-    if "[FAIL]" in clean_content or "FAIL" in clean_content.upper():
-        status = "FAIL"
-    elif "[PASS]" in clean_content or "PASS" in clean_content.upper():
-        status = "PASS"
-    else:
-        # Fallback: If it criticizes heavily, default to FAIL
-        status = "FAIL" if "missing" in clean_content.lower() or "hypothetical" in clean_content.lower() else "PASS"
-
-    print(f"🧪 Critic Verdict: {status}")
-    
-    # Extract feedback if it exists
+    # Force specificity: if the model gives a generic "Refine results", we override it
     feedback_match = re.search(r'Feedback:\s*(.*)', clean_content, re.IGNORECASE)
-    feedback = feedback_match.group(1) if feedback_match else "Refine search results."
+    feedback = feedback_match.group(1) if feedback_match else "Content is too generic; need more specific technical data."
+    
+    if status == "FAIL" and len(feedback) < 15:
+        feedback = "Provide more specific details, numbers, and technical specs relevant to the query."
 
-    log_event("critic", "init", f"Verdict: {status} | Feedback: {feedback}")
-    store_memory(
-    content=f"Task: {user_query}\nVerdict: {status}\nFeedback: {feedback}",
-    mem_type="learning"
-)
+    print(f"🧪 Critic Verdict: {status} | Iteration: {iteration}")
+    log_event("critic", f"iter-{iteration}", f"Verdict: {status} | Feedback: {feedback}")
 
+    # 5. Memory Storage (Only store unique learnings)
+    new_learning = f"Task: {user_query}\nFeedback: {feedback}"
+    if status == "FAIL" and len(feedback) > 15:
+        existing = recall_memory(new_learning, limit=1)
+        if not existing or existing[0][1] > 0.1: # Distance check
+            store_memory(content=new_learning, mem_type="learning")
+            print("🧠 [CRITIC] New failure-prevention memory stored.")
 
-    # 5. Return structured output that your graph can use to loop back
     return {
-        "critique_status": status,  # Use this key in your Conditional Edge
+        "critique_status": status,
         "critique_feedback": feedback,
-        "critique": "RETRY" if status == "FAIL" else "PASS" # Kept for the legacy conditional check
+        "critique": "RETRY" if status == "FAIL" else "PASS"
     }
 
 def improve_node(state: AgentState):
-    """Final polish/formatting."""
+    """
+    Final Salvage & Polish Node.
+    Synthesizes raw tool outputs into a professional report, 
+    addressing any lingering Critic concerns.
+    """
     print("✨ [IMPROVER] Finalizing report...")
     log_event("improve", "init", "Finalizing report.")
-    combined = "\n".join(state["results"])
 
-    prompt = f"Format and polish this into a professional final report:\n{combined}"
+    user_query = state.get("user_input", "")
+    results = state.get("results", [])
+    last_feedback = state.get("critique_feedback", "None")
+    status = state.get("critique_status", "PASS")
+
+    # Combine all execution results into a single context
+    combined_raw_data = "\n\n".join(results)
+
+    # If the Critic failed this, we tell the Improver to "Salvage" it
+    instruction = (
+        "The technical critic was NOT fully satisfied. Use your reasoning to patch any gaps "
+        f"mentioned in this feedback: '{last_feedback}'."
+        if status == "FAIL" else 
+        "The technical critic approved this work. Focus on professional formatting and clarity."
+    )
+
+    prompt = f"""
+You are a Senior Technical Writer and Data Analyst.
+Your goal: Transform raw tool outputs into a high-quality, professional report.
+
+### ORIGINAL USER QUERY:
+{user_query}
+
+### RAW DATA & FINDINGS:
+{combined_raw_data}
+
+### FINAL INSTRUCTION:
+{instruction}
+
+### REPORT REQUIREMENTS:
+1. **Executive Summary**: A concise 2-3 sentence overview.
+2. **Detailed Analysis**: Organize findings with clear headers.
+3. **Fact-First**: Ensure all numbers, names, and dates from the raw data are preserved.
+4. **Clean Exit**: Remove any tool artifacts like '[WEB_SEARCH RESULT]' or 'Python code output'.
+5. **No Fluff**: If specific data is missing, admit it professionally rather than hallucinating.
+
+Format the output in clean Markdown.
+"""
 
     response = chat(
         messages=[{"role": "user", "content": prompt}],
-        model="qwen2.5:7b-instruct"
+        model=MODEL_IMPROVER
     )
 
-    print("✨ Report finalized.")
+    # Final cleanup of any lingering 'thinking' tags
+    final_answer = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+
+    print("✨ Report finalized and polished.")
     log_event("improve", "init", "Report finalized.")
-    return {"final_answer": response}
+    
+    return {"final_answer": final_answer}
 
 # ==========================================
 # 3. GRAPH CONSTRUCTION
