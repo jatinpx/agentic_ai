@@ -1,0 +1,28 @@
+# Core framework
+fastapi
+uvicorn[standard]
+pydantic
+
+# LangGraph agent orchestration
+langgraph
+
+# LLM providers
+ollama
+
+# Database
+psycopg2-binary
+python-dotenv
+
+# Embeddings & reranking
+sentence-transformers
+numpy
+
+# Web search
+tavily-python
+duckduckgo-search
+
+# PDF reports
+fpdf2
+
+# LinkedIn API (HTTP client)
+httpx

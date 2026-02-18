@@ -29,16 +29,24 @@ def search_memory(embedding, limit=5):
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("""
-        SELECT content,(embedding <-> %s::vector) AS distance
+    # COUNT: 1st %s (Select), 2nd %s (Order By), 3rd %s (Limit)
+    query = """
+        SELECT content, (embedding <=> %s::vector) AS distance
         FROM agent_memory
-        ORDER BY distance ASC
+        ORDER BY embedding <=> %s::vector
         LIMIT %s
-        """, (embedding, limit))
-
-
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    return [(r[0], r[1]) for r in rows]
+    """
+    
+    # BSDK yahan 3 items bhejni hain kyunki upar 3 placeholders hain!
+    params = (embedding, embedding, int(limit))
+    
+    try:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        return [(str(r[0]), float(r[1])) for r in rows]
+    except Exception as e:
+        print(f"❌ SQL Error: {e}")
+        return []
+    finally:
+        cur.close()
+        conn.close()

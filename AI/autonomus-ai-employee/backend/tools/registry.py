@@ -6,13 +6,15 @@ from typing import Dict, Callable
 
 from tools.web_search import web_search_tool
 from tools.python_exec import python_exec_tool
+from tools.tavily_web_search import tavily_search
 
 # ==========================================
 # TOOL REGISTRY
 # ==========================================
 TOOLS: Dict[str, Callable] = {
-    "web_search": web_search_tool,
+    "web_search": tavily_search,
     "python_exec": python_exec_tool,
+    "tavily_search": tavily_search,
 }
 
 # ==========================================

@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState } from "react";
+import Link from "next/link";
 
 export default function Home() {
   // --- STATE ---
@@ -10,6 +11,7 @@ export default function Home() {
   const [threadId, setThreadId] = useState<string | null>(null);
   const [plan, setPlan] = useState<string[]>([]);
   const [awaitingApproval, setAwaitingApproval] = useState(false);
+  const [reportLoading, setReportLoading] = useState(false);
 
   // --- EFFECTS ---
 
@@ -23,6 +25,7 @@ export default function Home() {
     setResponse("");
     setPlan([]);
     setAwaitingApproval(false);
+    setReportLoading(false);
 
     try {
       const res = await fetch("http://127.0.0.1:8000/chat/start", {
@@ -66,10 +69,10 @@ export default function Home() {
         setAwaitingApproval(true);
         setResponse("");
       } else if (data.status === "complete") {
-        setResponse(data.final_answer);
+        setResponse(data.final_answer || "");
         setAwaitingApproval(false);
         setPlan([]);
-        setThreadId(null);
+        setThreadId(data.thread_id || threadId);
       } else {
         setResponse("Approval failed or unknown status");
         setAwaitingApproval(false);
@@ -94,13 +97,56 @@ export default function Home() {
     setPlan(newPlan);
   };
 
+  const approveResponseAndDownloadReport = async () => {
+    if (!threadId || !response) return;
+
+    setReportLoading(true);
+    try {
+      const res = await fetch("http://127.0.0.1:8000/chat/report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thread_id: threadId, approve: true }),
+      });
+
+      if (!res.ok) {
+        throw new Error("Report generation failed");
+      }
+
+      const blob = await res.blob();
+      const contentDisposition = res.headers.get("content-disposition") || "";
+      const filenameMatch = contentDisposition.match(/filename="?([^\"]+)"?/i);
+      const filename = filenameMatch?.[1] || `Report_${Date.now()}.pdf`;
+
+      const url = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      setResponse((prev) => `${prev}\n\n⚠️ Report download failed. Please try again.`);
+    } finally {
+      setReportLoading(false);
+    }
+  };
+
   // --- RENDER ---
   return (
     <main className="min-h-screen bg-[#0a0a0a] text-gray-100 flex flex-col items-center p-6 md:p-12 font-mono">
       <div className="w-full max-w-3xl">
-        <h1 className="text-2xl font-bold mb-8 text-center border-b border-gray-800 pb-4">
-          <span className="text-blue-500">SYSTEM:</span> AUTONOMOUS AGENT
-        </h1>
+        <div className="flex justify-between items-center mb-8 border-b border-gray-800 pb-4">
+          <h1 className="text-2xl font-bold">
+            <span className="text-blue-500">SYSTEM:</span> AUTONOMOUS AGENT
+          </h1>
+          <Link
+            href="/linkedin"
+            className="text-xs px-3 py-1.5 bg-blue-700 hover:bg-blue-600 rounded transition text-gray-200"
+          >
+            LinkedIn Agent
+          </Link>
+        </div>
 
         {/* INPUT SECTION */}
         <div className="flex gap-2 mb-8">
@@ -171,6 +217,15 @@ export default function Home() {
             </h2>
             <div className="text-sm leading-relaxed text-gray-300 whitespace-pre-wrap">
               {response}
+            </div>
+            <div className="mt-6">
+              <button
+                onClick={approveResponseAndDownloadReport}
+                disabled={reportLoading || loading || !threadId}
+                className="w-full bg-blue-700 hover:bg-blue-600 disabled:opacity-50 py-3 rounded text-sm font-bold uppercase tracking-wider transition-colors"
+              >
+                {reportLoading ? "Generating Report..." : "Approve Response & Download PDF"}
+              </button>
             </div>
           </div>
         )}

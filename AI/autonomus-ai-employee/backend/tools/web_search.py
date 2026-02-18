@@ -19,3 +19,5 @@ def web_search_tool(query: str) -> str:
 
     except Exception as e:
         return f"Web search error: {str(e)}"
+    
+

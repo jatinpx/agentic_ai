@@ -7,9 +7,7 @@ def store_memory(content: str, mem_type="general", task_id=None):
     insert_memory(content, emb, mem_type, task_id)
 
 
-def recall_memory(query: str, limit=5):
-    emb = embed_text(query)
-    results = search_memory(emb, limit)
-    # The search_memory returns [(content, distance), ...]
-    # We only want the 'content' string for the picker.
-    return [r[0] for r in results if r[0] is not None]
+def recall_memory(text: str, limit=5):
+    emb = embed_text(text, is_query=True)
+    # Direct return karo, string mein convert MAT karo yahan
+    return search_memory(emb, limit)

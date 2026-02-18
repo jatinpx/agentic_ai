@@ -2,19 +2,27 @@ import uuid
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from typing import Optional, List
 import os
+from pathlib import Path
+import re
 from services.memory_service import store_memory, recall_memory
-
+from services.langsmith_helper import init_langsmith_tracing
+from utilities.pdf_generation import generate_pdf_report
 
 # Importing your logic from the other files
 from brain.graph import build_full_agent # Ensure your graph file has this function
 from brain.logger import set_thread_id, clear_thread_id
+from brain.linkedin.routes import router as linkedin_router
 
 app = FastAPI()
 
 # Global graph instance (MemorySaver is inside build_full_agent)
 graph = build_full_agent()
+
+# Include LinkedIn content agent routes
+app.include_router(linkedin_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,6 +41,11 @@ class ApprovalRequest(BaseModel):
     thread_id: str
     approve: bool
     edited_plan: Optional[List[str]] = None # Optional: user can send back a modified plan
+
+
+class ReportApprovalRequest(BaseModel):
+    thread_id: str
+    approve: bool = True
 
 # --- ENDPOINTS ---
 
@@ -122,8 +135,63 @@ async def approve_research(req: ApprovalRequest):
     # IF FINAL COMPLETE
     # ===============================
     final_answer = new_state.values.get("final_answer")
+    if not final_answer:
+        final_results = new_state.values.get("results", [])
+        if isinstance(final_results, list):
+            final_answer = "\n".join([r for r in final_results if isinstance(r, str)])
+        else:
+            final_answer = str(final_results)
 
     return {
         "status": "complete",
-        "final_answer": final_answer
+        "final_answer": final_answer,
+        "thread_id": req.thread_id
     }
+
+
+def _clean_report_content(content: str) -> str:
+    if not content:
+        return ""
+    cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+@app.post("/chat/report")
+@app.post("/chat/report/")
+async def approve_and_generate_report(req: ReportApprovalRequest):
+    if not req.approve:
+        return {"status": "cancelled"}
+
+    config = {"configurable": {"thread_id": req.thread_id}}
+    current_state = graph.get_state(config)
+    if not current_state.values:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    final_answer = current_state.values.get("final_answer")
+    if not final_answer:
+        final_results = current_state.values.get("results", [])
+        if isinstance(final_results, list):
+            final_answer = "\n".join([r for r in final_results if isinstance(r, str)])
+        else:
+            final_answer = str(final_results)
+
+    if not final_answer or not str(final_answer).strip():
+        raise HTTPException(status_code=400, detail="No final response available for report generation")
+
+    title_input = current_state.values.get("user_input", "Agent Report")
+    cleaned_content = _clean_report_content(str(final_answer))
+    pdf_path = generate_pdf_report(cleaned_content, str(title_input))
+
+    if not pdf_path:
+        raise HTTPException(status_code=500, detail="Failed to generate report")
+
+    path_obj = Path(pdf_path)
+    if not path_obj.exists():
+        raise HTTPException(status_code=500, detail="Generated report file not found")
+
+    return FileResponse(
+        path=str(path_obj),
+        media_type="application/pdf",
+        filename=path_obj.name
+    )

@@ -1,14 +1,16 @@
 import re
+from turtle import distance
 import uuid
 from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+from numpy import rint
 from tools.registry import get_tool, list_tools
 from tools.registry import execute_tool, list_available_tools
 from services.memory_service import store_memory, recall_memory
 from services.memory_picker import pick_memory_for_role
 from services.llm_client import chat
-
+from utilities.pdf_generation import generate_pdf_report
 
 # --- OPTIONAL: Mock logger if brain.logger is not present ---
 try:
@@ -54,15 +56,32 @@ def planner_node(state: AgentState):
 
     # 1. Fetch raw memories (list of tuples)
     raw_mem_tuples = recall_memory(user_input, limit=8)
-    
-    # 2. Extract just the strings for the picker
-    raw_mem_strings = [m[0] for m in raw_mem_tuples if m[0]]
-    
-    # 3. Pick the best ones (Returns List[str])
-    picked = pick_memory_for_role(user_input, raw_mem_strings, role="planner", k=3)
+
+    # 2. Keep only semantically close memories to avoid stale-topic contamination
+    raw_mem_strings = []
+    for item in raw_mem_tuples:
+        if not item:
+            continue
+
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            content = str(item[0]).strip()
+            try:
+                distance_score = float(item[1])
+            except (TypeError, ValueError):
+                distance_score = 1.0
+
+            if content and distance_score <= 0.45:
+                raw_mem_strings.append(content)
+        else:
+            content = str(item).strip()
+            if content:
+                raw_mem_strings.append(content)
+
+    # 3. Pick best role-specific memories (Returns List[str])
+    picked = pick_memory_for_role(user_input, raw_mem_strings, role="planner", k=3) if raw_mem_strings else []
     
     # FIX: 'picked' is now just a list of strings
-    memo = "\n".join([f"- {m}" for m in picked])
+    memo = "\n".join([f"- {m}" for m in picked]) if picked else "- None"
 
     print(f"\n🧠 [PLANNER] Iteration {iteration} | Re-planning: {is_replan}")
     # ... rest of node ...
@@ -74,7 +93,8 @@ def planner_node(state: AgentState):
     critique_section = f"\n### ❌ FEEDBACK FROM PREVIOUS ATTEMPT:\n{feedback}\nYOU MUST ADDRESS THIS FEEDBACK IN YOUR NEW PLAN." if is_replan else ""
 
     prompt = f"""
-You are a senior autonomous AI planner. Your goal is to provide a plan that is highly specific, technical, and avoids generic summaries.
+You are a senior autonomous AI planner.
+Your single priority is to create a plan for THIS exact user goal, not prior topics.
 
 {critique_section}
 
@@ -85,26 +105,28 @@ USER GOAL:
 {user_input}
 
 AVAILABLE TOOLS:
-- web_search  → Use for specific technical data, newest facts, and detailed specs.
+- web_search  → Use for specific technical data, newest facts, and detailed specs and real-time web search with source URLs.
 - python_exec → Use for data processing, math, or structuring logic.
 - NONE        → Use for final reasoning and synthesis.
 
 STRICT PLANNING RULES:
 1. Output ONLY numbered steps.
 2. Each step MUST end with: | TOOL: tool_name
-3. If the previous attempt was "too generic", break your search steps into specific sub-topics (e.g., instead of "Search AI", use "Search for Agentic AI memory architectures and tool-use patterns").
-4. Ensure the plan includes a specific step for "Checking for technical details" to satisfy a strict critic.
-5. Max 5 steps. No intro/outro.
+3. Every step MUST stay on-topic for USER GOAL. Do NOT introduce unrelated domains.
+4. If user asks a simple definition/question (e.g., "what is X"), make a short factual plan (2-4 steps).
+5. If previous attempt was generic, break search into concrete sub-topics relevant to USER GOAL.
+6. Max 5 steps. No intro/outro.
 
-EXAMPLE OF SPECIFIC PLANNING:
-1. Search for specific technical architectures of {user_input} | TOOL: web_search
-2. Look for real-world case studies and industry-specific metrics | TOOL: web_search
-3. Synthesize technical specs into a detailed report | TOOL: NONE
+EXAMPLE FORMAT (content must match USER GOAL):
+1. Identify authoritative sources directly about "{user_input}" | TOOL: web_search
+2. Extract key facts, names, dates, and definitions related to "{user_input}" | TOOL: web_search
+3. Synthesize a concise answer for "{user_input}" | TOOL: none
 """
 
     raw_text = chat(
         messages=[{"role": "user", "content": prompt}],
-        model=MODEL_PLANNER
+        model=MODEL_PLANNER,
+        options={"temperature": 0.2, "top_p": 0.95, "num_ctx": 4096}
     )
 
     # --- Standard Cleaning Logic ---
@@ -127,10 +149,34 @@ EXAMPLE OF SPECIFIC PLANNING:
         if tool_name not in ["web_search", "python_exec", "none"]: tool_name = "none"
         parsed_steps.append(f"{step_text} | TOOL: {tool_name}")
 
-    if not parsed_steps:
-        parsed_steps = [f"Search for deep technical details on {user_input} | TOOL: web_search", "Analyze findings | TOOL: NONE"]
+    # Hard grounding pass: keep steps that mention query keywords or generic synthesis actions
+    stopwords = {
+        "what", "is", "the", "a", "an", "of", "for", "to", "in", "on", "and", "about", "me",
+        "tell", "explain", "please", "who", "when", "where", "why", "how"
+    }
+    query_keywords = [
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9]+", user_input)
+        if len(token) > 2 and token.lower() not in stopwords
+    ]
 
-    log_event("planner", f"iter-{iteration}", f"Plan created. Addressing feedback: {is_replan}")
+    if query_keywords and parsed_steps:
+        generic_actions = ("summar", "synthes", "analy", "report", "final", "verify")
+        grounded_steps = []
+        for step in parsed_steps:
+            lower_step = step.lower()
+            if any(keyword in lower_step for keyword in query_keywords) or any(action in lower_step for action in generic_actions):
+                grounded_steps.append(step)
+        if grounded_steps:
+            parsed_steps = grounded_steps
+
+    if not parsed_steps:
+        parsed_steps = [
+            f"Find what '{user_input}' refers to from reliable sources | TOOL: web_search",
+            f"Summarize the direct answer to '{user_input}' clearly | TOOL: none",
+        ]
+
+    log_event("planner", f"iter-{iteration}", f"Plan created. Addressing feedback: {is_replan} | memories_used={len(picked)}")
 
     return {
         "plan": parsed_steps[:5],
@@ -163,6 +209,7 @@ Use web_search ONLY if:
 - Need latest info
 - Need internet data
 - Need real-time prices/news
+- Need verified sources with URLs
 
 Use python_exec ONLY if:
 - Calculations needed
@@ -333,21 +380,33 @@ def executor_node(state: AgentState):
 
     # ... inside executor_node ...
     if len(clean_summary) > 60:
-        # Search for the 1 most similar memory
         existing = recall_memory(clean_summary, limit=1)
         
         should_save = True
-        if existing:
-            content, distance = existing[0]
-            print(f"📊 [MEMORY CHECK] Closest match distance: {distance:.4f}")
+        if existing and isinstance(existing, list) and len(existing) > 0:
+            try:
+                # tuple unpack: (content, distance)
+                result = existing[0]
+                
+                # Check agar result sach mein tuple/list hai
+                if isinstance(result, (tuple, list)) and len(result) >= 2:
+                    content = str(result[0])
+                    distance = float(result[1]) 
             
-            # If distance is very small, it's a duplicate.
-            # Adjust 0.1 based on your specific embedding model's sensitivity.
-            if distance < 0.1:
-                print("⚠️ [SKIP] Similar experience already exists in memory.")
-                should_save = False
+                    print(f"📊 [MEMORY CHECK] Match distance: {distance:.4f}")
+            
+                    if distance < 0.08:
+                        print("⚠️ [SKIP] Similar experience already exists.")
+                        should_save = False
+                else:
+                    print(f"⚠️ Unexpected result format: {type(result)} - {result}")
+            
+            except (ValueError, IndexError, TypeError) as e:
+                print(f"⚠️ Memory parsing failed ({e}). Value of existing[0]: {existing[0]}")
+                should_save = True
 
         if should_save:
+            # content=clean_summary hi pass karna, embedding store_memory ke andar banni chahiye
             store_memory(
                 content=clean_summary,
                 mem_type="experience",
@@ -360,6 +419,7 @@ def executor_node(state: AgentState):
 
     return {"results": results, "iteration_count": state.get("iteration_count", 0)}
 
+import re
 def critic_node(state: AgentState):
     """
     Constructive Critic Node.
@@ -450,7 +510,8 @@ def critic_node(state: AgentState):
     return {
         "critique_status": status,
         "critique_feedback": feedback,
-        "critique": "RETRY" if status == "FAIL" else "PASS"
+        "critique": "RETRY" if status == "FAIL" else "PASS",
+        "iteration_count": iteration
     }
 
 def improve_node(state: AgentState):
