@@ -39,19 +39,61 @@ from brain.linkedin.logging_utils import (
 
 
 # ==========================================
-# PER-NODE MODEL CONFIGURATION (from env)
+# PER-NODE MODEL CONFIGURATION (provider-aware)
 # ==========================================
-def _get_model(env_key: str, fallback: str = "qwen2.5:7b-instruct") -> str:
-    return os.getenv(env_key, fallback)
+# Supports switching between Ollama and Gemini via LLM_PROVIDER env var.
+# Each node reads from LINKEDIN_MODEL_* (Ollama) or LINKEDIN_GEMINI_MODEL_* (Gemini).
+#
+# When LLM_PROVIDER=ollama → uses LINKEDIN_MODEL_WRITER etc.
+# When LLM_PROVIDER=gemini → uses LINKEDIN_GEMINI_MODEL_WRITER etc.
+#
+# The chat() function in llm_client.py routes to the correct backend,
+# but we need provider-correct model names (e.g. "qwen2.5:7b-instruct"
+# for Ollama vs "gemini-2.0-flash" for Gemini).
+# ==========================================
 
-MODEL_INPUT       = lambda: _get_model("LINKEDIN_MODEL_INPUT")
-MODEL_STYLE_FETCH = lambda: _get_model("LINKEDIN_MODEL_STYLE_FETCH")
-MODEL_VIRAL_FETCH = lambda: _get_model("LINKEDIN_MODEL_VIRAL_FETCH")
-MODEL_TREND       = lambda: _get_model("LINKEDIN_MODEL_TREND")
-MODEL_HOOK_GEN    = lambda: _get_model("LINKEDIN_MODEL_HOOK_GEN")
-MODEL_WRITER      = lambda: _get_model("LINKEDIN_MODEL_WRITER")
-MODEL_OPTIMIZER   = lambda: _get_model("LINKEDIN_MODEL_OPTIMIZER")
-MODEL_SCORER      = lambda: _get_model("LINKEDIN_MODEL_SCORER")
+OLLAMA_DEFAULT = "qwen2.5:7b-instruct"
+GEMINI_DEFAULT = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+
+def _get_provider() -> str:
+    """Get current LLM provider (ollama or gemini)."""
+    return os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+
+
+def _get_model(node_key: str) -> str:
+    """
+    Get the model name for a specific node, respecting the active LLM provider.
+
+    Lookup order:
+      Ollama: LINKEDIN_MODEL_{node_key} → OLLAMA_MODEL_DEFAULT → hardcoded fallback
+      Gemini: LINKEDIN_GEMINI_MODEL_{node_key} → GEMINI_MODEL → hardcoded fallback
+    """
+    provider = _get_provider()
+
+    if provider == "gemini":
+        # Check per-node Gemini model first, then global GEMINI_MODEL
+        model = os.getenv(f"LINKEDIN_GEMINI_MODEL_{node_key}")
+        if model:
+            return model
+        return os.getenv("GEMINI_MODEL", GEMINI_DEFAULT)
+    else:
+        # Check per-node Ollama model first, then global OLLAMA_MODEL_DEFAULT
+        model = os.getenv(f"LINKEDIN_MODEL_{node_key}")
+        if model:
+            return model
+        return os.getenv("OLLAMA_MODEL_DEFAULT", OLLAMA_DEFAULT)
+
+
+# Per-node model getters (lazy — read env at call time, not import time)
+MODEL_INPUT       = lambda: _get_model("INPUT")
+MODEL_STYLE_FETCH = lambda: _get_model("STYLE_FETCH")
+MODEL_VIRAL_FETCH = lambda: _get_model("VIRAL_FETCH")
+MODEL_TREND       = lambda: _get_model("TREND")
+MODEL_HOOK_GEN    = lambda: _get_model("HOOK_GEN")
+MODEL_WRITER      = lambda: _get_model("WRITER")
+MODEL_OPTIMIZER   = lambda: _get_model("OPTIMIZER")
+MODEL_SCORER      = lambda: _get_model("SCORER")
 
 
 # ==========================================
