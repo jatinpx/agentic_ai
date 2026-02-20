@@ -41,11 +41,16 @@ def _approval_router(state: dict) -> str:
     status = state.get("approval_status", "")
     auto_publish = state.get("auto_publish", False)
 
+    print(f"[ROUTER DEBUG] approval_status={status}, auto_publish={auto_publish}")
+
     if status == "approved" or (auto_publish and status == "awaiting"):
+        print(f"[ROUTER DEBUG] returning: linkedin_publish")
         return "linkedin_publish"
     elif status == "regenerate":
+        print(f"[ROUTER DEBUG] returning: hook_generator")
         return "hook_generator"
     else:
+        print(f"[ROUTER DEBUG] returning: end")
         return "end"
 
 

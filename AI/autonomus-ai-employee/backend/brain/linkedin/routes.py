@@ -25,6 +25,7 @@ from services.linkedin_api import (
     is_authenticated,
     get_user_profile,
     get_access_token,
+    validate_oauth_state,
 )
 
 # ==========================================
@@ -89,6 +90,9 @@ async def generate_post(req: PostInput):
     current_state = linkedin_graph.get_state(config)
     values = current_state.values
 
+    if values.get("error"):
+        raise HTTPException(status_code=500, detail=str(values.get("error")))
+
     return {
         "thread_id": thread_id,
         "status": "awaiting_approval",
@@ -135,8 +139,22 @@ async def approve_post(req: LinkedInApprovalRequest):
     set_thread_id(req.thread_id)
 
     try:
-        # Resume the graph
-        linkedin_graph.invoke(None, config)
+        # Resume the graph - keep invoking until completion or next interrupt
+        max_iterations = 10
+        iteration = 0
+        while iteration < max_iterations:
+            result = linkedin_graph.invoke(None, config)
+            state_snapshot = linkedin_graph.get_state(config)
+            
+            # Check if we hit another interrupt or completed
+            if not state_snapshot.next or state_snapshot.next == ():
+                break
+            
+            # If we're back at human_approval interrupt, stop
+            if state_snapshot.next == ("human_approval",):
+                break
+                
+            iteration += 1
     except Exception as e:
         clear_thread_id()
         raise HTTPException(status_code=500, detail=f"Approval processing failed: {e}")
@@ -147,6 +165,9 @@ async def approve_post(req: LinkedInApprovalRequest):
     new_state = linkedin_graph.get_state(config)
     values = new_state.values
     next_node = new_state.next
+
+    if values.get("error"):
+        raise HTTPException(status_code=500, detail=str(values.get("error")))
 
     # Check if graph stopped again (regeneration → new approval needed)
     if next_node == ("human_approval",):
@@ -198,7 +219,10 @@ async def get_post(post_id: str):
 async def linkedin_auth_url():
     """Get the LinkedIn OAuth2 authorization URL to start the auth flow."""
     url = get_auth_url()
-    return {"auth_url": url}
+    return {
+        "auth_url": url,
+        "redirect_uri_note": "Ensure LINKEDIN_REDIRECT_URI points to your frontend callback: http://localhost:3000/api/linkedin/callback"
+    }
 
 
 @router.get("/auth/callback")
@@ -207,6 +231,9 @@ async def linkedin_auth_callback(code: str, state: Optional[str] = None):
     Handle LinkedIn OAuth2 callback.
     Exchange the authorization code for an access token.
     """
+    if not state or not validate_oauth_state(state):
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+
     result = exchange_code_for_token(code)
     if "error" in result:
         raise HTTPException(status_code=400, detail=f"OAuth2 failed: {result['error']}")

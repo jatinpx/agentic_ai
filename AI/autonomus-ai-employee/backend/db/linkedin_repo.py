@@ -12,6 +12,13 @@ def get_conn():
     return psycopg2.connect(DB_URL)
 
 
+def _to_vector_literal(embedding):
+    """Convert a Python embedding list into pgvector literal format: [0.1,0.2,...]."""
+    if embedding is None:
+        return None
+    return "[" + ",".join(str(float(x)) for x in embedding) + "]"
+
+
 # ==========================================
 # TABLE CREATION
 # ==========================================
@@ -24,6 +31,7 @@ def create_linkedin_tables():
     try:
         # Ensure pgvector extension
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto;")
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS linkedin_posts (
@@ -79,14 +87,15 @@ def insert_post(content, hook, cta, hashtags, embedding, viral_score,
     post_id = str(uuid.uuid4())
 
     try:
+        vector_literal = _to_vector_literal(embedding)
         cur.execute("""
             INSERT INTO linkedin_posts
                 (id, content, hook, cta, hashtags, embedding, viral_score,
                  tone, audience, topic, reasoning, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s::vector, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (
-            post_id, content, hook, cta, hashtags, embedding, viral_score,
+            post_id, content, hook, cta, hashtags, vector_literal, viral_score,
             tone, audience, topic, reasoning, status
         ))
         conn.commit()
@@ -115,7 +124,8 @@ def search_similar_posts(embedding, limit=5):
     """
 
     try:
-        cur.execute(query, (embedding, embedding, int(limit)))
+        vector_literal = _to_vector_literal(embedding)
+        cur.execute(query, (vector_literal, vector_literal, int(limit)))
         rows = cur.fetchall()
         return [
             {
@@ -289,11 +299,12 @@ def insert_viral_template(content, hook_pattern, category, embedding, engagement
     template_id = str(uuid.uuid4())
 
     try:
+        vector_literal = _to_vector_literal(embedding)
         cur.execute("""
             INSERT INTO linkedin_viral_templates
                 (id, content, hook_pattern, category, embedding, engagement_score)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (template_id, content, hook_pattern, category, embedding, engagement_score))
+            VALUES (%s, %s, %s, %s, %s::vector, %s)
+        """, (template_id, content, hook_pattern, category, vector_literal, engagement_score))
         conn.commit()
         return template_id
     except Exception as e:
@@ -320,7 +331,8 @@ def search_viral_templates(embedding, limit=5):
     """
 
     try:
-        cur.execute(query, (embedding, embedding, int(limit)))
+        vector_literal = _to_vector_literal(embedding)
+        cur.execute(query, (vector_literal, vector_literal, int(limit)))
         rows = cur.fetchall()
         return [
             {

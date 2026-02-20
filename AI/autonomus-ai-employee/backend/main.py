@@ -24,6 +24,42 @@ graph = build_full_agent()
 # Include LinkedIn content agent routes
 app.include_router(linkedin_router)
 
+# ==========================================
+# LINKEDIN OAUTH2 CALLBACK (Handles redirect from LinkedIn)
+# ==========================================
+
+@app.get("/api/linkedin/callback")
+async def linkedin_callback(code: str, state: Optional[str] = None, error: Optional[str] = None, error_description: Optional[str] = None):
+    """
+    Handle LinkedIn OAuth2 callback.
+    This endpoint matches the registered redirect URI in LinkedIn app settings.
+    Exchanges the authorization code for an access token.
+    """
+    # Check for OAuth errors from LinkedIn
+    if error:
+        return {
+            "status": "error",
+            "error": error,
+            "error_description": error_description or "Unknown error"
+        }
+    
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing authorization code")
+    
+    # Import here to avoid circular imports
+    from services.linkedin_api import exchange_code_for_token
+    
+    result = exchange_code_for_token(code)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=f"OAuth2 failed: {result['error']}")
+
+    return {
+        "status": "authenticated",
+        "message": "LinkedIn authentication successful. You can close this window.",
+        "access_token_preview": result.get("access_token", "")[:10] + "...",
+        "expires_in": result.get("expires_in"),
+    }
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,6 +67,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ==========================================
+# STARTUP: Initialize LinkedIn Database Tables
+# ==========================================
+
+@app.on_event("startup")
+async def startup_event():
+    """Create LinkedIn database tables on app startup if they don't exist."""
+    try:
+        from db.linkedin_repo import create_linkedin_tables
+        create_linkedin_tables()
+    except Exception as e:
+        print(f"Warning: Could not initialize LinkedIn tables: {e}")
+        # Don't crash the app if DB initialization fails
 
 # --- MODELS ---
 class ChatRequest(BaseModel):

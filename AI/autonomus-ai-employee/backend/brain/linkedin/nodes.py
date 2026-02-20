@@ -61,6 +61,11 @@ def _get_provider() -> str:
     return os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 
 
+def _is_low_cost_mode() -> bool:
+    """Reduce paid/free-tier API pressure by skipping non-essential LLM calls."""
+    return os.getenv("LINKEDIN_LOW_COST_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _get_model(node_key: str) -> str:
     """
     Get the model name for a specific node, respecting the active LLM provider.
@@ -300,6 +305,11 @@ def trend_research_node(state: Dict[str, Any]) -> Dict[str, Any]:
         topic = state.get("topic", "")
         trends = ""
 
+        if _is_low_cost_mode():
+            trends = f"Low-cost mode enabled. Skipping web trend research for topic: {topic}"
+            log_state_update("trend_research", "trends", f"{len(trends)} chars (low-cost mode)")
+            return {"trends": trends}
+
         try:
             # Search for current trends
             current_month = time.strftime("%B %Y")
@@ -353,6 +363,12 @@ def hook_generator_node(state: Dict[str, Any]) -> Dict[str, Any]:
         style_examples = state.get("style_examples", [])
         viral_examples = state.get("viral_examples", [])
         include_emojis = state.get("include_emojis", False)
+
+        if _is_low_cost_mode():
+            selected_hook = f"Here's what most people miss about {topic}."
+            hooks = [{"type": "low_cost", "text": selected_hook, "strength_score": 6}]
+            log_state_update("hook_generator", "hooks+selected_hook", f"{len(hooks)} hooks (low-cost mode)")
+            return {"hooks": hooks, "selected_hook": selected_hook}
 
         # Build context
         style_ctx = "\n".join([f"- {s[:200]}" for s in style_examples[:3]]) if style_examples else "None available"
@@ -573,6 +589,13 @@ def engagement_optimizer_node(state: Dict[str, Any]) -> Dict[str, Any]:
         original_cta = generated_post.get("cta", "")
         original_hook = generated_post.get("hook", "")
 
+        if _is_low_cost_mode():
+            optimized = generated_post.copy()
+            if not optimized.get("reasoning"):
+                optimized["reasoning"] = "Low-cost mode: skipped optimizer to save LLM quota"
+            log_state_update("engagement_optimizer", "optimized_post", "post kept (low-cost mode)")
+            return {"optimized_post": optimized}
+
         emoji_instruction = "Add 1-2 relevant emojis per section if they add value." if include_emojis else "Remove ALL emojis if any exist."
 
         prompt = f"""{MASTER_PROMPT}
@@ -654,6 +677,24 @@ def viral_scorer_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
         post_text = optimized_post.get("post", "")
         hook_text = optimized_post.get("hook", "")
+
+        if _is_low_cost_mode():
+            heuristic_score = 5.0
+            if hook_text:
+                heuristic_score += 0.5
+            if len(post_text) > 250:
+                heuristic_score += 0.5
+            heuristic_score = max(0.0, min(10.0, heuristic_score))
+
+            optimized = optimized_post.copy()
+            optimized["viral_score_prediction"] = heuristic_score
+            existing_reasoning = optimized.get("reasoning", "")
+            optimized["reasoning"] = (
+                (existing_reasoning + "\n\n") if existing_reasoning else ""
+            ) + "Viral score estimated in low-cost mode (heuristic, no scorer LLM call)."
+
+            log_state_update("viral_scorer", "viral_score", f"{heuristic_score}/10 (low-cost mode)")
+            return {"optimized_post": optimized, "viral_score": heuristic_score}
 
         # Compare with past high-performers
         similarity_context = ""
@@ -796,6 +837,13 @@ def store_post_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "score_breakdown": optimized_post.get("score_breakdown", {}),
         }
 
+        if not post_id:
+            return {
+                "final_post": final_post,
+                "post_id": "",
+                "error": "Failed to save generated post to database",
+            }
+
         log_state_update("store_post", "final_post+post_id", f"stored as {post_id}")
         return {"final_post": final_post, "post_id": post_id or ""}
 
@@ -809,6 +857,11 @@ def human_approval_node(state: Dict[str, Any]) -> Dict[str, Any]:
     The actual interrupt happens BEFORE this node via interrupt_before.
     """
     with NodeTimer("human_approval"):
+        current_status = state.get("approval_status", "")
+        if current_status in ("approved", "regenerate", "rejected"):
+            log_node("human_approval", "NODE EXECUTION", f"preserving approval_status={current_status}")
+            return {"approval_status": current_status}
+
         log_node("human_approval", "NODE EXECUTION", "awaiting human approval")
         return {"approval_status": "awaiting"}
 
@@ -819,10 +872,14 @@ def human_approval_node(state: Dict[str, Any]) -> Dict[str, Any]:
 def linkedin_publish_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Publish the approved post to LinkedIn."""
     with NodeTimer("linkedin_publish"):
+        log_node("linkedin_publish", "NODE EXECUTION", "linkedin_publish_node invoked")
+
         final_post = state.get("final_post", {})
         auto_publish = state.get("auto_publish", False)
         approval_status = state.get("approval_status", "")
         post_id = state.get("post_id", "")
+
+        log_node("linkedin_publish", "DEBUG", f"approval_status={approval_status}, auto_publish={auto_publish}, post_id={post_id}")
 
         # Only publish if approved or auto-publish enabled
         if approval_status not in ("approved",) and not auto_publish:
@@ -841,6 +898,8 @@ def linkedin_publish_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
         # Check for access token
         token = get_access_token()
+        log_node("linkedin_publish", "DEBUG", f"access_token present: {bool(token)}")
+
         if not token:
             log_error("linkedin_publish", "No LinkedIn access token. Complete OAuth2 flow first.")
             # Update post status to approved (but not published)
@@ -852,8 +911,12 @@ def linkedin_publish_node(state: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         # Publish
+        log_node("linkedin_publish", "DEBUG", f"calling publish_text_post with {len(full_text)} chars")
+
         try:
             result = publish_text_post(text=full_text, access_token=token)
+
+            log_node("linkedin_publish", "DEBUG", f"publish_text_post result: {result}")
 
             if "error" in result:
                 log_error("linkedin_publish", f"Publish failed: {result['error']}")

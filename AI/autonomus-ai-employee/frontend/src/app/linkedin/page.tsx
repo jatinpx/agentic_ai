@@ -107,6 +107,23 @@ export default function LinkedInPage() {
     checkAuth();
   }, []);
 
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return;
+      if (!event.data || event.data.type !== "linkedin-auth") return;
+
+      if (event.data.status === "success") {
+        setStatusMessage("LinkedIn connected successfully.");
+        checkAuth();
+      } else {
+        setStatusMessage(event.data.message || "LinkedIn authentication failed.");
+      }
+    };
+
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+
   // ==========================================
   // GENERATE POST
   // ==========================================
@@ -221,7 +238,20 @@ export default function LinkedInPage() {
       const res = await fetch(`${API_BASE}/linkedin/auth/url`);
       const data = await res.json();
       if (data.auth_url) {
-        window.open(data.auth_url, "_blank", "width=600,height=700");
+        const popup = window.open(data.auth_url, "_blank", "width=600,height=700");
+        if (!popup) {
+          setStatusMessage("Popup blocked. Please allow popups and try again.");
+          return;
+        }
+
+        setStatusMessage("Complete LinkedIn login in the popup window...");
+
+        const poll = window.setInterval(() => {
+          if (popup.closed) {
+            window.clearInterval(poll);
+            checkAuth();
+          }
+        }, 1000);
       }
     } catch {
       setStatusMessage("Failed to get auth URL");

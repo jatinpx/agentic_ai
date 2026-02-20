@@ -11,6 +11,8 @@ Required env vars:
 
 import os
 import json
+import time
+import secrets
 import urllib.request
 import urllib.parse
 from typing import Optional, Dict, Any
@@ -36,21 +38,48 @@ LINKEDIN_API_BASE = "https://api.linkedin.com"
 LINKEDIN_AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
 LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 
-# Scopes required for posting
-LINKEDIN_SCOPES = "openid profile w_member_social"
+# Scopes required for posting + user identity lookup
+LINKEDIN_SCOPES = "openid profile email w_member_social"
+
+# In-memory OAuth state storage (in production, persist in DB/Redis)
+_oauth_states: Dict[str, float] = {}
+STATE_TTL_SECONDS = 600
+
+
+def _cleanup_expired_states() -> None:
+    now = time.time()
+    expired = [key for key, created in _oauth_states.items() if now - created > STATE_TTL_SECONDS]
+    for key in expired:
+        _oauth_states.pop(key, None)
+
+
+def create_oauth_state() -> str:
+    _cleanup_expired_states()
+    state = secrets.token_urlsafe(24)
+    _oauth_states[state] = time.time()
+    return state
+
+
+def validate_oauth_state(state: str) -> bool:
+    _cleanup_expired_states()
+    if state in _oauth_states:
+        _oauth_states.pop(state, None)
+        return True
+    return False
 
 
 # ==========================================
 # OAUTH2 FLOW
 # ==========================================
 
-def get_auth_url(state: str = "linkedin_oauth") -> str:
+def get_auth_url(state: Optional[str] = None) -> str:
     """Generate LinkedIn OAuth2 authorization URL."""
+    oauth_state = state or create_oauth_state()
     params = urllib.parse.urlencode({
         "response_type": "code",
         "client_id": LINKEDIN_CLIENT_ID,
         "redirect_uri": LINKEDIN_REDIRECT_URI,
-        "state": state,
+        "state": oauth_state,
         "scope": LINKEDIN_SCOPES,
     })
     return f"{LINKEDIN_AUTH_URL}?{params}"
