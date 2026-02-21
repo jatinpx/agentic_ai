@@ -26,6 +26,7 @@ from services.memory_service import recall_memory
 from services.memory_picker import pick_memory_for_role
 from embeddings.embedder import embed_text
 from tools.tavily_web_search import tavily_search, tavily_search_structured
+from brain.linkedin.usage_tracker import track_llm_call, track_search_call, get_usage_tracker
 from db.linkedin_repo import (
     insert_post,
     search_similar_posts,
@@ -102,6 +103,8 @@ MODEL_STYLE_FETCH = lambda: _get_model("STYLE_FETCH")
 MODEL_VIRAL_FETCH = lambda: _get_model("VIRAL_FETCH")
 MODEL_TREND       = lambda: _get_model("TREND")
 MODEL_TREND_DISCOVERY = lambda: _get_model("TREND_DISCOVERY")
+MODEL_QUERY_REFINE = lambda: _get_model("QUERY_REFINE")
+MODEL_QUERY_GEN = lambda: _get_model("QUERY_GEN")
 MODEL_CLAIM_EXTRACT = lambda: _get_model("CLAIM_EXTRACT")
 MODEL_FACT_VERIFY = lambda: _get_model("FACT_VERIFY")
 MODEL_ANGLE = lambda: _get_model("ANGLE")
@@ -503,6 +506,155 @@ def _soften_absolutist_hook(hook: str) -> str:
 
 
 # ==========================================
+# NODE 0.5: INPUT REFINEMENT
+# ==========================================
+
+def _is_gibberish_word(word: str) -> bool:
+    """Check if a word appears to be keyboard smashing or nonsense."""
+    word_lower = word.lower()
+    
+    # Keyboard pattern detection (common rows)
+    keyboard_patterns = ['qwerty', 'asdf', 'zxcv', 'qwe', 'asd', 'zxc', 'wert', 'sdfg', 'xcvb']
+    if any(pattern in word_lower for pattern in keyboard_patterns):
+        return True
+    
+    # Repeated character detection (aaa, bbb, zzz)
+    if len(word) >= 3 and len(set(word_lower)) == 1:
+        return True
+    
+    # Check for excessive repeated characters (>80% same char)
+    if len(word) >= 3:
+        char_counts = {}
+        for ch in word_lower:
+            char_counts[ch] = char_counts.get(ch, 0) + 1
+        max_repeats = max(char_counts.values())
+        if max_repeats / len(word) > 0.8:
+            return True
+    
+    # Low vowel ratio for longer words (less than 15% vowels)
+    if len(word) >= 4:
+        vowels = sum(1 for ch in word_lower if ch in 'aeiou')
+        vowel_ratio = vowels / len(word)
+        if vowel_ratio < 0.15:
+            return True
+    
+    return False
+
+
+def _validate_topic_quality(topic: str) -> tuple[bool, str]:
+    """Validate topic quality by detecting gibberish patterns."""
+    words = topic.split()
+    if len(words) == 0:
+        return False, "Topic is empty"
+    
+    # Check for repeated words (e.g., "as as", "test test test")
+    unique_words = set(w.lower() for w in words if len(w) >= 2)
+    if len(unique_words) == 1 and len(words) >= 2:
+        return False, "Topic contains only repeated words. Please provide a meaningful topic."
+    
+    # Check if all words are very short (<=2 chars) - likely gibberish
+    if all(len(w) <= 2 for w in words):
+        return False, "Topic too vague. Please provide a clear topic with descriptive words."
+    
+    # Count gibberish words
+    gibberish_count = sum(1 for word in words if len(word) >= 2 and _is_gibberish_word(word))
+    
+    # Reject if 50% or more of words are gibberish
+    gibberish_ratio = gibberish_count / len(words)
+    if gibberish_ratio >= 0.5:
+        return False, "Topic appears to be nonsense or keyboard smashing. Please provide a meaningful topic."
+    
+    return True, ""
+
+
+def input_refinement_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Clean or rewrite user input into a strong research topic if needed."""
+    with NodeTimer("input_refinement"):
+        raw_topic = (state.get("topic") or "").strip()
+        if not raw_topic:
+            return {"error": "Empty topic after validation"}
+
+        # Check for gibberish patterns first
+        is_valid, error_msg = _validate_topic_quality(raw_topic)
+        if not is_valid:
+            log_error("input_refinement", f"Gibberish detected: {raw_topic}")
+            return {"error": error_msg}
+
+        # Reject clearly nonsensical input (gibberish, too short, no meaning)
+        topic_cleaned = re.sub(r"\s+", " ", raw_topic)
+        word_count = len(topic_cleaned.split())
+        alpha_chars = sum(1 for ch in topic_cleaned if ch.isalpha())
+        digit_ratio = sum(1 for ch in topic_cleaned if ch.isdigit()) / max(len(topic_cleaned), 1)
+        
+        # Reject if: single char/word, too many digits, or mostly gibberish
+        if word_count == 1 and len(topic_cleaned) < 3:
+            log_error("input_refinement", "Topic too short - must be at least 3 characters or 2+ words")
+            return {"error": "Topic too short. Please provide a clear topic (e.g., 'AI in healthcare', 'Future of remote work')"}
+        
+        if digit_ratio > 0.5 or alpha_chars < 3:
+            log_error("input_refinement", f"Topic appears to be gibberish: {raw_topic}")
+            return {"error": "Topic unclear. Please provide a meaningful topic in plain language (e.g., 'sustainable energy trends', 'startup funding strategies')"}
+        
+        is_good = word_count >= 3 and any(ch.isalpha() for ch in topic_cleaned)
+
+        if _is_low_cost_mode():
+            if not is_good:
+                topic_cleaned = f"Latest developments in {topic_cleaned}".strip()
+                is_good = True
+            return {
+                "topic_original": raw_topic,
+                "topic": topic_cleaned,
+                "topic_cleaned": topic_cleaned,
+                "query_quality": 0.7 if is_good else 0.4,
+                "query_rewrite_reason": "low_cost_cleanup",
+            }
+
+        prompt = f"""You are improving a research query for credible sourcing.
+
+RAW INPUT: {raw_topic}
+
+Return JSON only:
+{{
+  "cleaned_topic": "...",
+  "is_good": true,
+  "reason": "..."
+}}
+
+Rules:
+- If the input is already specific, return it unchanged and is_good=true.
+- If vague, rewrite into a specific, researchable topic without adding false facts.
+- Keep it under 12 words.
+"""
+
+        try:
+            response = chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=MODEL_QUERY_REFINE(),
+                options={"temperature": 0.2, "num_ctx": 2048},
+            )
+            track_llm_call("input_refinement", response, model=MODEL_QUERY_REFINE(), purpose="Input topic refinement")
+            
+            parsed = _parse_json_from_llm(response)
+            cleaned = (parsed.get("cleaned_topic") or topic_cleaned).strip()
+            is_good = bool(parsed.get("is_good", True))
+            reason = parsed.get("reason", "")
+        except Exception as e:
+            log_error("input_refinement", f"Query refinement failed: {e}")
+            cleaned = topic_cleaned
+            is_good = True
+            reason = "refinement_failed"
+
+        log_state_update("input_refinement", "topic_cleaned", cleaned)
+        return {
+            "topic_original": raw_topic,
+            "topic": cleaned,
+            "topic_cleaned": cleaned,
+            "query_quality": 0.8 if is_good else 0.5,
+            "query_rewrite_reason": reason,
+        }
+
+
+# ==========================================
 # NODE 1: INPUT VALIDATION
 # ==========================================
 def input_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -632,8 +784,8 @@ def viral_posts_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
                         "distance": t.get("distance", 1.0),
                     })
 
-            # 2. Search high-scoring past posts (>= 7.0 only)
-            top_posts = get_top_posts(limit=5, min_score=7.0)
+            # 2. Search high-scoring past posts (>= 8.0 only)
+            top_posts = get_top_posts(limit=5, min_score=8.0)
             for p in top_posts:
                 if p.get("content"):
                     viral_examples.append({
@@ -676,6 +828,8 @@ def trend_discovery_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
         for query in queries:
             result = tavily_search_structured(query=query, max_results=4)
+            track_search_call("trend_discovery", query, len(result.get("results", [])))
+            
             for item in result.get("results", []):
                 url = (item.get("url") or "").strip()
                 title = (item.get("title") or "").strip()
@@ -755,6 +909,8 @@ Rules:
                 model=MODEL_CLAIM_EXTRACT(),
                 options={"temperature": 0.1, "num_ctx": 8192},
             )
+            track_llm_call("claim_extraction", response, model=MODEL_CLAIM_EXTRACT(), purpose="Extract structured claims")
+            
             parsed = _parse_json_from_llm(response)
             extracted_claims = parsed.get("claims", []) if isinstance(parsed.get("claims", []), list) else []
         except Exception as e:
@@ -802,6 +958,8 @@ def fact_verification_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
             verification_query = f"{claim_text} source news {topic}"
             verification = tavily_search_structured(query=verification_query, max_results=4)
+            track_search_call("fact_verification", verification_query, len(verification.get("results", [])))
+            
             source_count = int(verification.get("count", 0) or 0)
             top_results = verification.get("results", [])[:3]
             source_urls = [r.get("url", "") for r in top_results if r.get("url")]
@@ -874,6 +1032,156 @@ def fact_verification_node(state: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "verified_claims": verified_claims,
             "research_confidence": research_confidence,
+        }
+
+
+# ==========================================
+# NODE 6.2: RESEARCH QUALITY ASSESSMENT
+# ==========================================
+def research_quality_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute research realism score from verified claims (pre-hook)."""
+    with NodeTimer("research_quality"):
+        verified_claims = state.get("verified_claims", [])
+        realism = _compute_realism_components(verified_claims, "")
+        realism_score = _safe_float(realism.get("realism_score", 0.0), 0.0)
+        research_confidence = _safe_float(state.get("research_confidence", 0.0), 0.0)
+        retries = int(state.get("research_retry_count", 0) or 0)
+        max_retries = int(os.getenv("LINKEDIN_MAX_RESEARCH_RETRIES", "3"))
+        min_confidence = float(os.getenv("LINKEDIN_MIN_RESEARCH_CONFIDENCE", "0.6"))
+        min_realism = float(os.getenv("LINKEDIN_MIN_RESEARCH_REALISM", "0.6"))
+
+        log_state_update("research_quality", "research_realism_score", f"{realism_score}")
+        if retries >= max_retries and (research_confidence < min_confidence or realism_score < min_realism):
+            log_error(
+                "research_quality",
+                f"FAILED_GATE: confidence={research_confidence}, realism={realism_score}, retries={retries}/{max_retries}",
+            )
+            return {
+                "research_realism_score": realism_score,
+                "approval_status": "rejected",
+                "error": f"rejected_due_to_low_research_quality:confidence={research_confidence},realism={realism_score}",
+            }
+
+        return {"research_realism_score": realism_score}
+
+
+# ==========================================
+# NODE 6.3: SOURCE-AWARE QUERY GENERATOR
+# ==========================================
+def source_query_generator_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate targeted research queries based on weak evidence."""
+    with NodeTimer("source_query_generator"):
+        topic = state.get("topic", "")
+        verified_claims = state.get("verified_claims", [])
+        risk_flags = state.get("risk_flags", [])
+
+        base_queries = [
+            f"{topic} Reuters",
+            f"{topic} Bloomberg",
+            f"{topic} Financial Times",
+            f"{topic} arxiv preprint",
+            f"{topic} GitHub repository",
+        ]
+
+        if _is_low_cost_mode():
+            queries = base_queries
+            for claim in verified_claims[:4]:
+                claim_text = (claim.get("claim") or "").strip()
+                if claim_text:
+                    queries.append(f"{claim_text} independent source")
+            if "controversy" in risk_flags:
+                queries.append(f"{topic} regulator investigation")
+            return {"research_queries": queries[:12]}
+
+        claims_blob = "\n".join([f"- {c.get('claim', '')}" for c in verified_claims[:6]]) or "None"
+        prompt = f"""Create targeted research queries for independent verification.
+
+TOPIC: {topic}
+VERIFIED CLAIMS:
+{claims_blob}
+
+Return JSON only:
+{{
+  "queries": ["...", "...", "..."]
+}}
+
+Rules:
+- 6 to 10 queries
+- Mix independent news sources and primary research (e.g., Reuters, Bloomberg, FT, arXiv, GitHub)
+- Keep each query under 12 words
+- Avoid repeating the same phrasing
+"""
+
+        try:
+            response = chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=MODEL_QUERY_GEN(),
+                options={"temperature": 0.3, "num_ctx": 2048},
+            )
+            parsed = _parse_json_from_llm(response)
+            queries = parsed.get("queries", []) if isinstance(parsed.get("queries"), list) else []
+        except Exception as e:
+            log_error("source_query_generator", f"Query generation failed: {e}")
+            queries = base_queries
+
+        merged = []
+        seen = set()
+        for q in (queries + base_queries):
+            if not isinstance(q, str):
+                continue
+            q = q.strip()
+            key = q.lower()
+            if not q or key in seen:
+                continue
+            seen.add(key)
+            merged.append(q)
+        return {"research_queries": merged[:12]}
+
+
+# ==========================================
+# NODE 6.4: TARGETED RE-SEARCH
+# ==========================================
+def targeted_research_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Run targeted research queries and merge results into trend candidates."""
+    with NodeTimer("targeted_research"):
+        topic = state.get("topic", "")
+        queries = state.get("research_queries", [])
+        existing = state.get("trend_candidates", [])
+
+        if not queries:
+            return {"trend_candidates": existing, "trends": state.get("trends", "")}
+
+        trend_candidates = list(existing)
+        seen_urls = {c.get("source") for c in existing if c.get("source")}
+
+        for query in queries[:12]:
+            result = tavily_search_structured(query=query, max_results=4)
+            for item in result.get("results", [])[:4]:
+                url = (item.get("url") or "").strip()
+                title = (item.get("title") or "").strip()
+                snippet = (item.get("content") or "").strip()
+                if not url or url in seen_urls or not snippet:
+                    continue
+                seen_urls.add(url)
+                trend_candidates.append({
+                    "title": title,
+                    "source": url,
+                    "claim": snippet[:500],
+                    "date": item.get("published_date", ""),
+                    "confidence": 0.6,
+                    "query": query,
+                })
+
+        trend_candidates = trend_candidates[:20]
+        trend_blob = "\n".join(
+            [f"- {t.get('title', '')}: {t.get('claim', '')[:220]} ({t.get('source', '')})" for t in trend_candidates[:10]]
+        )
+
+        log_state_update("targeted_research", "trend_candidates", f"{len(trend_candidates)} merged signals")
+        return {
+            "trend_candidates": trend_candidates,
+            "trends": trend_blob,
+            "research_retry_count": int(state.get("research_retry_count", 0) or 0) + 1,
         }
 
 
@@ -1335,6 +1643,11 @@ DO NOT give every hook a 7. Most hooks are 4-6. Only rate 8+ if it's genuinely e
             hooks = [{"type": "fallback", "text": selected_hook, "strength_score": 5}]
 
         next_iteration = iteration_count + 1
+        
+        # Update context variable for usage tracking
+        from brain.logger import set_iteration_count
+        set_iteration_count(next_iteration)
+        
         log_state_update("hook_generator", "hooks+selected_hook", f"iter {next_iteration}: {len(hooks)} hooks, best: {selected_hook[:50]}...")
         return {"hooks": hooks, "selected_hook": selected_hook, "iteration_count": next_iteration}
 
@@ -1505,6 +1818,7 @@ Do NOT default to 7.5. Most posts are 5-6."""
                 model=MODEL_WRITER(),
                 options={"temperature": 0.7, "num_ctx": 8192},
             )
+            track_llm_call("post_writer", response, model=MODEL_WRITER(), purpose="Generate LinkedIn post")
 
             generated_post = _parse_json_from_llm(response)
 
@@ -1553,6 +1867,8 @@ Current draft:
                     model=MODEL_WRITER(),
                     options={"temperature": 0.5, "num_ctx": 8192},
                 )
+                track_llm_call("post_writer", expanded_raw, model=MODEL_WRITER(), purpose="Expand short post")
+                
                 expanded = _parse_json_from_llm(expanded_raw)
                 if expanded.get("post") and _word_count(expanded.get("post", "")) >= 170:
                     generated_post.update({
@@ -1679,6 +1995,7 @@ CRITICAL: Keep the author's core message and voice. You are editing, not rewriti
                 model=MODEL_OPTIMIZER(),
                 options={"temperature": 0.5, "num_ctx": 8192},
             )
+            track_llm_call("engagement_optimizer", response, model=MODEL_OPTIMIZER(), purpose="Optimize for engagement")
 
             optimized = _parse_json_from_llm(response)
 
@@ -1962,6 +2279,7 @@ Score each dimension independently. Think step-by-step for each one.
                 model=MODEL_SCORER(),
                 options={"temperature": 0.3, "num_ctx": 8192},
             )
+            track_llm_call("viral_scorer", response, model=MODEL_SCORER(), purpose="Score viral potential")
 
             scored = _parse_json_from_llm(response)
             breakdown = scored.get("breakdown", {})
@@ -2250,6 +2568,17 @@ def store_post_node(state: Dict[str, Any]) -> Dict[str, Any]:
             }
 
         log_state_update("store_post", "final_post+post_id", f"stored as {post_id}")
+        
+        # Send pipeline_complete event for draft mode (before human_approval interrupt)
+        log_agent_end(
+            post_id,
+            viral_score,
+            final_post=final_post,
+            iteration_count=state.get("iteration_count", 0),
+            hooks=state.get("hooks", []),
+            realism_score=realism_score
+        )
+        
         return {"final_post": final_post, "post_id": post_id or ""}
 
 
@@ -2351,7 +2680,14 @@ def linkedin_publish_node(state: Dict[str, Any]) -> Dict[str, Any]:
                         payload=engagement.get("payload", {}),
                     )
 
-            log_agent_end(post_id, state.get("viral_score", 0))
+            log_agent_end(
+                post_id, 
+                state.get("viral_score", 0),
+                final_post=final_post,
+                iteration_count=state.get("iteration_count", 0),
+                hooks=state.get("hooks", []),
+                realism_score=state.get("realism_score", 0.0)
+            )
             log_state_update("linkedin_publish", "publish_url", publish_url)
 
             return {

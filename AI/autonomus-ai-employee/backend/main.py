@@ -81,6 +81,16 @@ async def startup_event():
     except Exception as e:
         print(f"Warning: Could not initialize LinkedIn tables: {e}")
         # Don't crash the app if DB initialization fails
+    
+    # Store the main event loop for WebSocket broadcasts from background threads
+    try:
+        import asyncio
+        from brain.linkedin.websocket_manager import set_main_loop
+        loop = asyncio.get_running_loop()
+        set_main_loop(loop)
+        print(f"[Startup] Event loop stored for WebSocket broadcasting")
+    except Exception as e:
+        print(f"Warning: Could not store event loop: {e}")
 
 # --- MODELS ---
 class ChatRequest(BaseModel):

@@ -7,6 +7,8 @@ class LinkedInAgentState(TypedDict):
     # --- User Input ---
     user_input: dict          # Raw PostInput dict
     topic: str
+    topic_original: str
+    topic_cleaned: str
     tone: str
     audience: str
     goal: str
@@ -24,6 +26,8 @@ class LinkedInAgentState(TypedDict):
     risk_flags: list          # Risk flags derived from contradiction search
     controversy_score: float  # Aggregate controversy signal (0-1)
     confidence_adjustment: float  # Adjustment applied after contradiction scan
+    research_queries: list    # Targeted source-aware queries
+    research_realism_score: float  # Realism score from verified claims only
     angle_package: dict       # Chosen strategic angle + supporting facts
     pov_package: dict          # Insider POV framing for authority tone
     research_confidence: float  # Confidence in research quality (0-1)

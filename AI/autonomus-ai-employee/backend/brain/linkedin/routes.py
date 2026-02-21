@@ -4,21 +4,25 @@ LinkedIn Content Agent — FastAPI Routes.
 Endpoints:
     POST /linkedin/generate        — Generate a LinkedIn post (stops at approval)
     POST /linkedin/approve         — Approve/regenerate/reject a post
+    POST /linkedin/abort           — Abort a running pipeline
     GET  /linkedin/posts           — List all generated posts
     GET  /linkedin/posts/{post_id} — Get a specific post
     GET  /linkedin/auth/url        — Get LinkedIn OAuth2 authorization URL
     GET  /linkedin/auth/callback   — Handle OAuth2 callback
     GET  /linkedin/auth/status     — Check if LinkedIn is authenticated
+    WS   /linkedin/ws/{thread_id}  — WebSocket for real-time pipeline updates
 """
 
 import uuid
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, BackgroundTasks
 from typing import Optional
 
 from brain.linkedin.models import PostInput, LinkedInApprovalRequest, LinkedInAuthCallback
 from brain.linkedin.graph import build_linkedin_agent
 from brain.logger import set_thread_id, clear_thread_id
+from brain.linkedin.cancellation import request_abort, clear_abort, is_abort_requested, PipelineAborted
 from db.linkedin_repo import get_all_posts, get_post_by_id
+from brain.linkedin.websocket_manager import ws_manager
 from services.linkedin_api import (
     get_auth_url,
     exchange_code_for_token,
@@ -40,21 +44,119 @@ linkedin_graph = build_linkedin_agent()
 
 
 # ==========================================
+# BACKGROUND PIPELINE EXECUTION
+# ==========================================
+
+def run_linkedin_pipeline(thread_id: str, initial_state: dict):
+    """
+    Background task to run the LinkedIn pipeline asynchronously.
+    This unblocks the HTTP request so other endpoints remain responsive.
+    Progress is streamed via WebSocket to connected clients.
+    """
+    import time
+    from brain.linkedin.logging_utils import log_agent_start, log_error
+    from brain.linkedin.usage_tracker import init_usage_tracker, get_usage_tracker
+    
+    config = {"configurable": {"thread_id": thread_id}}
+    set_thread_id(thread_id)
+    clear_abort(thread_id)
+    
+    # Initialize usage tracking for this pipeline run
+    init_usage_tracker()
+    
+    # Initialize iteration count
+    from brain.logger import set_iteration_count
+    set_iteration_count(0)
+    
+    # Small delay to allow WebSocket connection to establish
+    time.sleep(0.5)
+    
+    # Broadcast pipeline start
+    topic = initial_state.get("user_input", {}).get("topic", "unknown")
+    log_agent_start(topic)
+    
+    try:
+        # Invoke the pipeline - will stop at human_approval interrupt
+        linkedin_graph.invoke(initial_state, config)
+    except PipelineAborted:
+        linkedin_graph.update_state(config, {
+            "approval_status": "aborted",
+            "error": "Pipeline aborted by user",
+        })
+        print(f"[LINKEDIN] Pipeline aborted cleanly for thread {thread_id}")
+    except Exception as e:
+        # Log error and broadcast via WebSocket
+        log_error("pipeline", f"Pipeline execution failed: {e}")
+    finally:
+        # Get final usage stats with iteration count from state
+        try:
+            final_state = linkedin_graph.get_state(config)
+            iteration = final_state.values.get("iteration_count", 0)
+        except:
+            iteration = 0
+        
+        tracker = get_usage_tracker()
+        from brain.logger import set_iteration_count
+        set_iteration_count(iteration)  # Update context for final summary
+        usage_summary = tracker.get_summary()
+        print(f"[USAGE] Pipeline completed: {usage_summary}")
+        clear_abort(thread_id)
+        clear_thread_id()
+
+
+# ==========================================
 # POST GENERATION
 # ==========================================
 
+def validate_topic_quality(topic: str) -> tuple[bool, str]:
+    """Validate topic quality before starting pipeline. Returns (is_valid, error_message)."""
+    import re
+    
+    topic = topic.strip()
+    if not topic:
+        return False, "Topic cannot be empty. Please provide a meaningful topic."
+    
+    # Check basic quality
+    topic_cleaned = re.sub(r"\s+", " ", topic)
+    word_count = len(topic_cleaned.split())
+    alpha_chars = sum(1 for ch in topic_cleaned if ch.isalpha())
+    digit_ratio = sum(1 for ch in topic_cleaned if ch.isdigit()) / max(len(topic_cleaned), 1)
+    
+    # Reject single character or very short gibberish
+    if word_count == 1 and len(topic_cleaned) < 3:
+        return False, "Topic too short. Please write at least 2-3 words describing your topic (e.g., 'AI in healthcare', 'remote work trends')."
+    
+    # Reject if mostly digits or too few letters
+    if digit_ratio > 0.5 or alpha_chars < 3:
+        return False, "Topic unclear. Please use plain language to describe your topic (e.g., 'sustainable energy solutions', 'startup funding strategies')."
+    
+    # Warn if suspiciously short (1 word with 3+ chars)
+    if word_count == 1:
+        return False, "Topic is too vague. Please provide more context (e.g., instead of 'AI', write 'AI in education' or 'AI safety concerns')."
+    
+    return True, ""
+
+
 @router.post("/generate")
-async def generate_post(req: PostInput):
+async def generate_post(req: PostInput, background_tasks: BackgroundTasks):
     """
-    Start the LinkedIn post generation pipeline.
-    Runs all nodes up to human_approval, then stops for approval.
-    Returns thread_id and the generated post preview.
+    Start the LinkedIn post generation pipeline in the background.
+    Returns thread_id immediately - connect to WebSocket for live updates.
+    Pipeline runs all nodes up to human_approval, then stops for approval.
+    
+    Usage:
+        1. POST /generate → get thread_id
+        2. Open WebSocket at /ws/{thread_id}
+        3. Receive live status as pipeline runs
+        4. POST /approve when ready
     """
+    # Validate topic quality BEFORE starting pipeline
+    is_valid, error_message = validate_topic_quality(req.topic)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_message)
+    
     thread_id = str(uuid.uuid4())
-    config = {"configurable": {"thread_id": thread_id}}
-
-    set_thread_id(thread_id)
-
+    
     initial_state = {
         "user_input": req.model_dump(),
         "topic": "",
@@ -85,34 +187,26 @@ async def generate_post(req: PostInput):
         "error": "",
         "iteration_count": 0,
         "score_feedback": {},
+        "usage_stats": {
+            "llm_calls": 0,
+            "search_calls": 0,
+            "total_api_calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
     }
-
-    try:
-        linkedin_graph.invoke(initial_state, config)
-    except Exception as e:
-        clear_thread_id()
-        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
-    finally:
-        clear_thread_id()
-
-    # Get state after pipeline halted at human_approval
-    current_state = linkedin_graph.get_state(config)
-    values = current_state.values
-
-    if values.get("error"):
-        raise HTTPException(status_code=500, detail=str(values.get("error")))
-
+    
+    # Schedule pipeline to run in background
+    background_tasks.add_task(run_linkedin_pipeline, thread_id, initial_state)
+    
+    # Return immediately with thread_id
+    # Frontend should open WebSocket to /ws/{thread_id} for live updates
     return {
         "thread_id": thread_id,
-        "status": "awaiting_approval",
-        "final_post": values.get("final_post", {}),
-        "viral_score": values.get("viral_score", 0.0),
-        "realism_score": values.get("realism_score", 0.0),
-        "hooks": values.get("hooks", []),
-        "selected_hook": values.get("selected_hook", ""),
-        "trends": values.get("trends", ""),
-        "research_confidence": values.get("research_confidence", 0.0),
-        "post_id": values.get("post_id", ""),
+        "status": "pipeline_starting",
+        "message": "Connect to WebSocket at /linkedin/ws/{thread_id} for live updates",
+        "websocket_url": f"/linkedin/ws/{thread_id}"
     }
 
 
@@ -133,6 +227,8 @@ async def approve_post(req: LinkedInApprovalRequest):
     current_state = linkedin_graph.get_state(config)
     if not current_state.values:
         raise HTTPException(status_code=404, detail="Session not found")
+    if is_abort_requested(req.thread_id) or current_state.values.get("approval_status") == "aborted":
+        raise HTTPException(status_code=409, detail="Pipeline already aborted")
 
     # Update state with approval decision
     update = {"approval_status": req.action}
@@ -143,7 +239,12 @@ async def approve_post(req: LinkedInApprovalRequest):
         update["final_post"] = final_post
 
     if req.action == "regenerate":
-        update["iteration_count"] = current_state.values.get("iteration_count", 0) + 1
+        new_iteration = current_state.values.get("iteration_count", 0) + 1
+        update["iteration_count"] = new_iteration
+        
+        # Update context variable for usage tracking
+        from brain.logger import set_iteration_count
+        set_iteration_count(new_iteration)
 
     linkedin_graph.update_state(config, update)
 
@@ -154,6 +255,13 @@ async def approve_post(req: LinkedInApprovalRequest):
         max_iterations = 10
         iteration = 0
         while iteration < max_iterations:
+            if is_abort_requested(req.thread_id):
+                linkedin_graph.update_state(config, {
+                    "approval_status": "aborted",
+                    "error": "Pipeline aborted by user",
+                })
+                raise PipelineAborted("Pipeline aborted during approval processing")
+
             result = linkedin_graph.invoke(None, config)
             state_snapshot = linkedin_graph.get_state(config)
             
@@ -166,6 +274,9 @@ async def approve_post(req: LinkedInApprovalRequest):
                 break
                 
             iteration += 1
+    except PipelineAborted as e:
+        clear_thread_id()
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         clear_thread_id()
         raise HTTPException(status_code=500, detail=f"Approval processing failed: {e}")
@@ -178,7 +289,23 @@ async def approve_post(req: LinkedInApprovalRequest):
     next_node = new_state.next
 
     if values.get("error"):
-        raise HTTPException(status_code=500, detail=str(values.get("error")))
+        error_msg = str(values.get("error"))
+        
+        # Parse low realism error to make it user-friendly
+        if "rejected_due_to_low_realism" in error_msg:
+            try:
+                score = float(error_msg.split(":")[1])
+                raise HTTPException(
+                    status_code=422, 
+                    detail=f"Cannot publish: Research quality score too low ({score:.2f}/1.0). The post contains claims that cannot be verified with available sources. Try regenerating or editing the topic to focus on well-documented facts."
+                )
+            except (IndexError, ValueError):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Cannot publish: Research quality score too low. The post contains unverifiable claims."
+                )
+        
+        raise HTTPException(status_code=500, detail=error_msg)
 
     # Check if graph stopped again (regeneration → new approval needed)
     if next_node == ("human_approval",):
@@ -202,6 +329,36 @@ async def approve_post(req: LinkedInApprovalRequest):
         "realism_score": values.get("realism_score", 0.0),
         "post_id": values.get("post_id", ""),
     }
+
+
+@router.post("/abort")
+async def abort_pipeline(req: dict):
+    """
+    Abort a running pipeline and clean up resources.
+    This marks the thread as aborted but doesn't stop the background task.
+    """
+    thread_id = req.get("thread_id")
+    if not thread_id:
+        raise HTTPException(status_code=400, detail="thread_id required")
+    
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    try:
+        request_abort(thread_id)
+
+        # Mark state as aborted
+        linkedin_graph.update_state(config, {
+            "approval_status": "aborted",
+            "error": "Pipeline aborted by user"
+        })
+        
+        # Disconnect any WebSocket connections for this thread
+        from brain.linkedin.websocket_manager import ws_manager
+        # Note: connections will be cleaned up when client disconnects
+        
+        return {"status": "aborted", "thread_id": thread_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Abort failed: {e}")
 
 
 # ==========================================
@@ -288,3 +445,83 @@ async def linkedin_auth_status():
         "message": "Token expired or invalid. Re-authenticate.",
         "author_target": author_target,
     }
+
+
+# ==========================================
+# WEBSOCKET STREAMING
+# ==========================================
+
+@router.websocket("/ws/{thread_id}")
+async def websocket_pipeline_status(websocket: WebSocket, thread_id: str):
+    """
+    WebSocket endpoint for streaming live pipeline status updates.
+    
+    Clients connect with a thread_id and receive real-time events as the
+    LinkedIn content pipeline executes:
+    - node_start: Node begins execution
+    - node_complete: Node finishes (with metrics)
+    - state_update: State key changes
+    - error: Node fails
+    - pipeline_complete: Full pipeline done
+    
+    Usage:
+        const ws = new WebSocket('ws://127.0.0.1:8000/linkedin/ws/thread-id-123')
+    """
+    await ws_manager.connect(thread_id, websocket)
+    
+    try:
+        # Send connection confirmation
+        await websocket.send_json({
+            "type": "connected",
+            "thread_id": thread_id,
+            "message": "WebSocket connected - pipeline updates will stream here"
+        })
+        
+        # Keep connection alive and listen for messages
+        # (Pipeline will broadcast via ws_manager.broadcast())
+        while True:
+            try:
+                # Wait for messages from client (e.g., "cancel" command in future)
+                data = await websocket.receive_text()
+                
+                # For now, just echo back (could handle "cancel" later)
+                if data == "ping":
+                    await websocket.send_json({"type": "pong"})
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                # Any other error, disconnect
+                break
+    
+    finally:
+        await ws_manager.disconnect(thread_id, websocket)
+
+
+@router.get("/status/{thread_id}")
+async def get_pipeline_status(thread_id: str):
+    """
+    Fallback HTTP endpoint to poll pipeline status if WebSocket fails.
+    Returns current state snapshot from LangGraph checkpointer.
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    try:
+        state = linkedin_graph.get_state(config)
+        
+        if not state.values:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        
+        return {
+            "thread_id": thread_id,
+            "current_node": state.next[0] if state.next else "complete",
+            "is_complete": not state.next or state.next == (),
+            "viral_score": state.values.get("viral_score", 0),
+            "realism_score": state.values.get("realism_score", 0),
+            "iteration_count": state.values.get("iteration_count", 0),
+            "approval_status": state.values.get("approval_status", ""),
+            "post_id": state.values.get("post_id", ""),
+            "final_post": state.values.get("final_post", {}),
+            "error": state.values.get("error", ""),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Status check failed: {e}")
