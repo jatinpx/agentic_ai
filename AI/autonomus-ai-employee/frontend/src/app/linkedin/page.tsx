@@ -249,7 +249,11 @@ export default function LinkedInPage() {
         setAwaitingApproval(false);
         setPublishUrl(data.publish_url || "");
         setFinalPost(data.final_post || finalPost);
-        setStatusMessage(data.publish_url ? "✅ Published to LinkedIn." : "✅ Workflow complete.");
+        if (data.status === "publish_failed" || data.status === "approved_not_published") {
+          setStatusMessage(`⚠️ ${data.message || data.error || "Post approved, but publishing failed."}`);
+        } else {
+          setStatusMessage(data.publish_url ? "✅ Published to LinkedIn." : "✅ Workflow complete.");
+        }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Action failed.";

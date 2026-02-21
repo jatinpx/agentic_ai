@@ -231,7 +231,8 @@ async def approve_post(req: LinkedInApprovalRequest):
         raise HTTPException(status_code=409, detail="Pipeline already aborted")
 
     # Update state with approval decision
-    update = {"approval_status": req.action}
+    # Clear stale non-fatal errors (e.g. prior publish_failed) so retries can proceed.
+    update = {"approval_status": req.action, "error": ""}
     if req.edited_post:
         # User manually edited the post — update final_post content
         final_post = current_state.values.get("final_post", {})
@@ -290,6 +291,20 @@ async def approve_post(req: LinkedInApprovalRequest):
 
     if values.get("error"):
         error_msg = str(values.get("error"))
+        approval_status = str(values.get("approval_status", "") or "")
+
+        # Publish failures are non-fatal for approval flow; return actionable status.
+        if approval_status in ("publish_failed", "approved_not_published"):
+            return {
+                "status": approval_status,
+                "final_post": values.get("final_post", {}),
+                "publish_url": values.get("publish_url", ""),
+                "viral_score": values.get("viral_score", 0.0),
+                "realism_score": values.get("realism_score", 0.0),
+                "post_id": values.get("post_id", ""),
+                "error": error_msg,
+                "message": "Post approved, but publishing failed. Check LinkedIn token/author configuration and retry.",
+            }
         
         # Parse low realism error to make it user-friendly
         if "rejected_due_to_low_realism" in error_msg:
