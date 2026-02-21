@@ -26,6 +26,7 @@ from services.linkedin_api import (
     get_user_profile,
     get_access_token,
     validate_oauth_state,
+    get_configured_author_target,
 )
 
 # ==========================================
@@ -65,17 +66,25 @@ async def generate_post(req: PostInput):
         "style_examples": [],
         "viral_examples": [],
         "trends": "",
+        "trend_candidates": [],
+        "extracted_claims": [],
+        "verified_claims": [],
+        "angle_package": {},
+        "research_confidence": 0.0,
+        "research_retry_count": 0,
         "hooks": [],
         "selected_hook": "",
         "generated_post": {},
         "optimized_post": {},
         "viral_score": 0.0,
+        "realism_score": 0.0,
         "final_post": {},
         "post_id": "",
         "approval_status": "",
         "publish_url": "",
         "error": "",
         "iteration_count": 0,
+        "score_feedback": {},
     }
 
     try:
@@ -98,9 +107,11 @@ async def generate_post(req: PostInput):
         "status": "awaiting_approval",
         "final_post": values.get("final_post", {}),
         "viral_score": values.get("viral_score", 0.0),
+        "realism_score": values.get("realism_score", 0.0),
         "hooks": values.get("hooks", []),
         "selected_hook": values.get("selected_hook", ""),
         "trends": values.get("trends", ""),
+        "research_confidence": values.get("research_confidence", 0.0),
         "post_id": values.get("post_id", ""),
     }
 
@@ -175,6 +186,7 @@ async def approve_post(req: LinkedInApprovalRequest):
             "status": "awaiting_approval",
             "final_post": values.get("final_post", {}),
             "viral_score": values.get("viral_score", 0.0),
+            "realism_score": values.get("realism_score", 0.0),
             "hooks": values.get("hooks", []),
             "selected_hook": values.get("selected_hook", ""),
             "post_id": values.get("post_id", ""),
@@ -187,6 +199,7 @@ async def approve_post(req: LinkedInApprovalRequest):
         "final_post": values.get("final_post", {}),
         "publish_url": values.get("publish_url", ""),
         "viral_score": values.get("viral_score", 0.0),
+        "realism_score": values.get("realism_score", 0.0),
         "post_id": values.get("post_id", ""),
     }
 
@@ -221,7 +234,8 @@ async def linkedin_auth_url():
     url = get_auth_url()
     return {
         "auth_url": url,
-        "redirect_uri_note": "Ensure LINKEDIN_REDIRECT_URI points to your frontend callback: http://localhost:3000/api/linkedin/callback"
+        "redirect_uri_note": "Ensure LINKEDIN_REDIRECT_URI points to your frontend callback: http://localhost:3000/api/linkedin/callback",
+        "author_target": get_configured_author_target(),
     }
 
 
@@ -249,8 +263,13 @@ async def linkedin_auth_callback(code: str, state: Optional[str] = None):
 async def linkedin_auth_status():
     """Check if LinkedIn is currently authenticated."""
     token = get_access_token()
+    author_target = get_configured_author_target()
     if not token:
-        return {"authenticated": False, "message": "No access token. Start OAuth2 flow."}
+        return {
+            "authenticated": False,
+            "message": "No access token. Start OAuth2 flow.",
+            "author_target": author_target,
+        }
 
     authenticated = is_authenticated()
     if authenticated:
@@ -261,6 +280,11 @@ async def linkedin_auth_status():
                 "name": profile.get("name", ""),
                 "email": profile.get("email", ""),
             },
+            "author_target": author_target,
         }
 
-    return {"authenticated": False, "message": "Token expired or invalid. Re-authenticate."}
+    return {
+        "authenticated": False,
+        "message": "Token expired or invalid. Re-authenticate.",
+        "author_target": author_target,
+    }

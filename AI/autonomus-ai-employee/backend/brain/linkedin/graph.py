@@ -2,15 +2,20 @@
 LinkedIn Content Agent — LangGraph Pipeline.
 
 Flow:
-    input_node → style_memory_fetch → viral_posts_fetch → trend_research
-    → hook_generator → post_writer → engagement_optimizer → viral_scorer
+    input_node → style_memory_fetch → viral_posts_fetch → trend_discovery
+    → claim_extraction → fact_verification → contradiction_node → angle_builder
+    → pov_builder → hook_generator
+    → post_writer → engagement_optimizer → viral_scorer
     → store_post → human_approval → linkedin_publish → END
 
 Supports:
     - Human-in-the-loop approval (interrupt_before=["human_approval"])
     - Regeneration loop (approval_status=="regenerate" → hook_generator)
+    - Auto-iteration loop until target score (viral_scorer → hook_generator)
     - Auto-publish bypass
 """
+
+import os
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -20,7 +25,12 @@ from brain.linkedin.nodes import (
     input_node,
     style_memory_fetch_node,
     viral_posts_fetch_node,
-    trend_research_node,
+    trend_discovery_node,
+    claim_extraction_node,
+    fact_verification_node,
+    contradiction_node,
+    angle_builder_node,
+    pov_builder_node,
     hook_generator_node,
     post_writer_node,
     engagement_optimizer_node,
@@ -29,6 +39,25 @@ from brain.linkedin.nodes import (
     human_approval_node,
     linkedin_publish_node,
 )
+
+
+def _research_router(state: dict) -> str:
+    """
+    Route after fact verification:
+    - if research_confidence >= 0.6 OR retries exhausted -> contradiction
+    - else -> trend_discovery (research again)
+    """
+    confidence = float(state.get("research_confidence", 0.0) or 0.0)
+    retries = int(state.get("research_retry_count", 0) or 0)
+    max_retries = int(os.getenv("LINKEDIN_MAX_RESEARCH_RETRIES", "3"))
+
+    print(f"[RESEARCH ROUTER] confidence={confidence}, retries={retries}/{max_retries}")
+
+    if confidence >= 0.6:
+        return "contradiction"
+    if retries >= max_retries:
+        return "contradiction"
+    return "trend_discovery"
 
 
 def _approval_router(state: dict) -> str:
@@ -54,6 +83,32 @@ def _approval_router(state: dict) -> str:
         return "end"
 
 
+def _score_router(state: dict) -> str:
+    """
+    Route after viral_scorer:
+    - score >= target OR max iterations reached → store_post
+    - else → hook_generator (iterate with scorer feedback)
+    """
+    target = float(os.getenv("LINKEDIN_TARGET_VIRAL_SCORE", "8.5"))
+    max_iters = int(os.getenv("LINKEDIN_MAX_AUTO_ITERATIONS", "6"))
+
+    score = float(state.get("viral_score", 0.0) or 0.0)
+    iters = int(state.get("iteration_count", 0) or 0)
+
+    print(f"[SCORE ROUTER] score={score}, target={target}, iteration={iters}/{max_iters}")
+
+    if score > target:
+        print("[SCORE ROUTER] returning: store_post (target met)")
+        return "store_post"
+
+    if iters >= max_iters:
+        print("[SCORE ROUTER] returning: store_post (max iterations reached)")
+        return "store_post"
+
+    print("[SCORE ROUTER] returning: hook_generator (iterate)")
+    return "hook_generator"
+
+
 def build_linkedin_agent():
     """
     Build and compile the LinkedIn content generation LangGraph.
@@ -68,7 +123,12 @@ def build_linkedin_agent():
     graph.add_node("input_node", input_node)
     graph.add_node("style_memory_fetch", style_memory_fetch_node)
     graph.add_node("viral_posts_fetch", viral_posts_fetch_node)
-    graph.add_node("trend_research", trend_research_node)
+    graph.add_node("trend_discovery", trend_discovery_node)
+    graph.add_node("claim_extraction", claim_extraction_node)
+    graph.add_node("fact_verification", fact_verification_node)
+    graph.add_node("contradiction", contradiction_node)
+    graph.add_node("angle_builder", angle_builder_node)
+    graph.add_node("pov_builder", pov_builder_node)
     graph.add_node("hook_generator", hook_generator_node)
     graph.add_node("post_writer", post_writer_node)
     graph.add_node("engagement_optimizer", engagement_optimizer_node)
@@ -87,13 +147,35 @@ def build_linkedin_agent():
     # ==========================================
     graph.add_edge("input_node", "style_memory_fetch")
     graph.add_edge("style_memory_fetch", "viral_posts_fetch")
-    graph.add_edge("viral_posts_fetch", "trend_research")
-    graph.add_edge("trend_research", "hook_generator")
+    graph.add_edge("viral_posts_fetch", "trend_discovery")
+    graph.add_edge("trend_discovery", "claim_extraction")
+    graph.add_edge("claim_extraction", "fact_verification")
+    graph.add_edge("contradiction", "angle_builder")
+    graph.add_edge("angle_builder", "pov_builder")
+    graph.add_edge("pov_builder", "hook_generator")
     graph.add_edge("hook_generator", "post_writer")
+    graph.add_conditional_edges(
+        "fact_verification",
+        _research_router,
+        {
+            "trend_discovery": "trend_discovery",
+            "contradiction": "contradiction",
+        },
+    )
+
     graph.add_edge("post_writer", "engagement_optimizer")
     graph.add_edge("engagement_optimizer", "viral_scorer")
-    graph.add_edge("viral_scorer", "store_post")
     graph.add_edge("store_post", "human_approval")
+
+    # Score-based auto-iteration loop
+    graph.add_conditional_edges(
+        "viral_scorer",
+        _score_router,
+        {
+            "store_post": "store_post",
+            "hook_generator": "hook_generator",
+        },
+    )
 
     # ==========================================
     # CONDITIONAL EDGE AFTER HUMAN APPROVAL

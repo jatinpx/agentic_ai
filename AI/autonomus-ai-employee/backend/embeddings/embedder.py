@@ -3,6 +3,8 @@ import importlib
 import os
 import urllib.error
 import urllib.request
+import ollama
+
 
 # Keep in sync with pgvector schema (vector(1536))
 OUTPUT_DIM = 1536

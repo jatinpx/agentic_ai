@@ -11,8 +11,11 @@ Each node:
 import os
 import re
 import json
+import ast
 import time
+import math
 from typing import Dict, Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -22,15 +25,18 @@ from services.llm_client import chat
 from services.memory_service import recall_memory
 from services.memory_picker import pick_memory_for_role
 from embeddings.embedder import embed_text
-from tools.tavily_web_search import tavily_search
+from tools.tavily_web_search import tavily_search, tavily_search_structured
 from db.linkedin_repo import (
     insert_post,
     search_similar_posts,
     search_viral_templates,
     get_top_posts,
     update_post_status,
+    insert_research_snapshot,
+    insert_angle_result,
+    insert_post_engagement,
 )
-from services.linkedin_api import publish_text_post, get_access_token
+from services.linkedin_api import publish_text_post, get_access_token, fetch_post_engagement
 from brain.linkedin.models import PostInput
 from brain.linkedin.logging_utils import (
     log_node, log_agent_start, log_agent_end,
@@ -95,6 +101,11 @@ MODEL_INPUT       = lambda: _get_model("INPUT")
 MODEL_STYLE_FETCH = lambda: _get_model("STYLE_FETCH")
 MODEL_VIRAL_FETCH = lambda: _get_model("VIRAL_FETCH")
 MODEL_TREND       = lambda: _get_model("TREND")
+MODEL_TREND_DISCOVERY = lambda: _get_model("TREND_DISCOVERY")
+MODEL_CLAIM_EXTRACT = lambda: _get_model("CLAIM_EXTRACT")
+MODEL_FACT_VERIFY = lambda: _get_model("FACT_VERIFY")
+MODEL_ANGLE = lambda: _get_model("ANGLE")
+MODEL_POV = lambda: _get_model("POV")
 MODEL_HOOK_GEN    = lambda: _get_model("HOOK_GEN")
 MODEL_WRITER      = lambda: _get_model("WRITER")
 MODEL_OPTIMIZER   = lambda: _get_model("OPTIMIZER")
@@ -102,44 +113,41 @@ MODEL_SCORER      = lambda: _get_model("SCORER")
 
 
 # ==========================================
+# EMBEDDING QUALITY THRESHOLDS
+# ==========================================
+# Cosine distance caps — lower = stricter match (0 = identical, 1 = opposite)
+STYLE_MAX_DISTANCE = 0.35     # Only very close style matches
+VIRAL_MAX_DISTANCE = 0.40     # Slightly looser for viral templates
+SIMILAR_MAX_DISTANCE = 0.45   # For scorer comparison
+MEMORY_MAX_DISTANCE = 0.40    # For general memory recall
+MIN_STORE_SCORE = 5.0         # Don't store posts scoring below this
+MIN_RETRIEVAL_SCORE = 5.0     # Don't retrieve low-quality past posts
+
+# ==========================================
 # MASTER SYSTEM PROMPT
 # ==========================================
-MASTER_PROMPT = """You are an elite LinkedIn content strategist and viral post generator.
+MASTER_PROMPT = """You are a world-class LinkedIn ghostwriter used by top founders, VCs, and tech leaders.
 
-Your job is to create high-quality LinkedIn posts that maximize:
-- engagement
-- authority
-- clarity
-- authenticity
-- saves and comments
+YOUR WRITING PRINCIPLES:
+1. PATTERN INTERRUPT: The first line must break the reader's scroll reflex. Use unexpected statements, bold claims, or counterintuitive openings.
+2. INFORMATION DENSITY: Every sentence must teach, provoke, or move the story forward. Zero filler.
+3. VOICE AUTHENTICITY: Write like a real person sharing hard-won experience — not a chatbot summarizing the internet. Use first-person. Be specific. Name real tools, numbers, timelines.
+4. STRUCTURAL RHYTHM: Alternate between 1-line punches and 2-3 line explanations. Use whitespace aggressively. One idea per paragraph.
+5. EMOTIONAL ARC: Every post needs tension → insight → resolution. The reader should feel something shift in their understanding.
+6. ENGAGEMENT ENGINEERING: End with a genuine question that people WANT to answer — not a generic "What do you think?" but a specific dilemma or choice.
 
-You DO NOT write generic AI content.
-You write like a real human expert with strong opinions and insights.
+HARD RULES:
+- NEVER use these words/phrases: "In today's fast-paced world", "game-changer", "let's dive in", "Here's the thing", "It's not about X, it's about Y" (unless given as user style)
+- NEVER start with a question (questions are weak hooks on LinkedIn)
+- NEVER use more than 3 hashtags
+- NEVER write paragraphs longer than 3 lines
+- NEVER use bullet points in the first half of the post — earn the reader's attention with narrative first
+- If the user says no emojis → absolute zero emojis, not even in hashtags
+- Keep total post length between 150-280 words (LinkedIn sweet spot for engagement)
 
-POST GOALS:
-- Hook reader in first 2 lines
-- Provide value, insight, or story
-- Sound human, not robotic
-- Be concise and readable
-- Use line breaks for LinkedIn formatting
-- End with engagement CTA (question/debate/insight)
-
-STYLE RULES:
-- No cringe AI tone
-- No emojis unless requested
-- Avoid corporate buzzwords
-- Use strong hooks
-- Use curiosity + authority
-- Write like an experienced tech professional
-- If controversial tone requested → be bold but intelligent
-
-CONTENT INTELLIGENCE:
-When writing posts:
-- Analyze past viral posts from memory
-- Reuse high-performing hook patterns
-- Maintain user's writing style
-- Optimize for readability & saves
-- Prefer clarity over complexity"""
+QUALITY BAR:
+- Would a VP of Engineering at a FAANG company share this? If not, rewrite.
+- Does every line pass the "so what?" test? If a line doesn't change the reader's action or belief, cut it."""
 
 
 def _clean_think_tags(text: str) -> str:
@@ -150,27 +158,348 @@ def _clean_think_tags(text: str) -> str:
 def _parse_json_from_llm(text: str) -> dict:
     """Extract JSON from LLM response, handling markdown code blocks."""
     cleaned = _clean_think_tags(text)
-    
-    # Try to extract JSON from markdown code block
-    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
-    if json_match:
-        cleaned = json_match.group(1)
-    
-    # Try direct JSON parse
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-    
-    # Try to find a JSON object in the text
-    brace_match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", cleaned, re.DOTALL)
-    if brace_match:
+    cleaned = cleaned.strip()
+
+    # Collect parse candidates from code blocks and bracket spans
+    candidates = [cleaned]
+
+    code_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, flags=re.IGNORECASE)
+    candidates.extend(cb.strip() for cb in code_blocks if cb.strip())
+
+    first_brace, last_brace = cleaned.find("{"), cleaned.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        candidates.append(cleaned[first_brace:last_brace + 1].strip())
+
+    first_bracket, last_bracket = cleaned.find("["), cleaned.rfind("]")
+    if first_bracket != -1 and last_bracket > first_bracket:
+        candidates.append(cleaned[first_bracket:last_bracket + 1].strip())
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        # Strict JSON first
         try:
-            return json.loads(brace_match.group())
-        except json.JSONDecodeError:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+            if isinstance(parsed, list):
+                return {"items": parsed}
+        except Exception:
             pass
-    
+
+        # Python literal fallback (helps local LLM outputs with single quotes)
+        try:
+            parsed = ast.literal_eval(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+            if isinstance(parsed, list):
+                return {"items": parsed}
+        except Exception:
+            pass
+
     return {}
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\b\w+\b", text or ""))
+
+
+def _is_generic_cta(cta: str) -> bool:
+    low = (cta or "").strip().lower()
+    generic_patterns = [
+        "what do you think",
+        "thoughts",
+        "drop your thoughts",
+        "let me know",
+        "comment below",
+        "your take",
+    ]
+    return any(p in low for p in generic_patterns)
+
+
+def _extract_hook_candidates(raw_text: str, topic: str) -> list:
+    """Best-effort extraction of hook lines from messy local-LLM output."""
+    cleaned = _clean_think_tags(raw_text)
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+
+    hooks = []
+    disallowed_prefixes = (
+        "here are",
+        "the best hook",
+        "this hook works",
+        "reason",
+        "output",
+        "json",
+        "hook types",
+        "task",
+    )
+    for ln in lines:
+        ln = re.sub(r"^[\-\*\d\.)\s]+", "", ln).strip().strip('"')
+        if len(ln) < 18 or len(ln) > 180:
+            continue
+        ll = ln.lower()
+        if ll.startswith(disallowed_prefixes):
+            continue
+        if any(token in ll for token in ["{", "}", "\"text\"", "best_hook_index", "strength_score"]):
+            continue
+        if ll.startswith(("type", "reason", "best_hook", "hook:")):
+            ln = ln.split(":", 1)[-1].strip()
+        if len(ln.split()) < 5:
+            continue
+        hooks.append(ln)
+
+    # Deduplicate while preserving order
+    deduped = []
+    seen = set()
+    for hook in hooks:
+        key = re.sub(r"\W+", "", hook.lower())
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(hook)
+
+    # Last-resort hook bank to avoid single-hook output
+    if len(deduped) < 5:
+        fallback_bank = [
+            f"Most teams misunderstand {topic} — and it is costing them months.",
+            f"After watching smart teams fail with {topic}, one pattern keeps repeating.",
+            f"Unpopular take: most advice about {topic} is optimized for likes, not results.",
+            f"I used to think {topic} was about tools. It is actually about decision quality.",
+            f"If your strategy for {topic} fits in one sentence, it is probably too shallow.",
+        ]
+        for item in fallback_bank:
+            key = re.sub(r"\W+", "", item.lower())
+            if key not in seen:
+                seen.add(key)
+                deduped.append(item)
+            if len(deduped) >= 5:
+                break
+
+    return deduped[:5]
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _source_quality_from_url(url: str) -> float:
+    if not url:
+        return 0.3
+    u = url.lower()
+    high = ["reuters.com", "bloomberg.com", "ft.com", "economictimes", "moneycontrol", "forbes", "techcrunch", "thehindu", "livemint"]
+    medium = ["github.com", "arxiv.org", "analyticsvidhya", "towardsdatascience"]
+    open_platforms = ["medium.com", "substack", "hashnode", "dev.to", "wordpress"]
+    if any(h in u for h in high):
+        return 0.9
+    if any(m in u for m in medium):
+        return 0.75
+    if any(o in u for o in open_platforms):
+        return 0.45
+    return 0.5
+
+
+def _weighted_source_quality(source_quality_avg: float, source_count: int) -> float:
+    weighted = _safe_float(source_quality_avg, 0.0) * math.log(max(int(source_count), 0) + 1)
+    return _clamp(weighted, 0.0, 1.0)
+
+
+def _independence_score(unique_domains: int) -> float:
+    if unique_domains >= 3:
+        return 1.0
+    if unique_domains == 2:
+        return 0.7
+    return 0.4
+
+
+def _recency_score(date_text: str, topic: str = "") -> float:
+    if not date_text:
+        return 0.5
+    # lightweight heuristic: if year appears and recent, higher score
+    m = re.search(r"(20\d{2})", date_text)
+    if not m:
+        return 0.6
+    year = int(m.group(1))
+    topic_l = (topic or "").lower()
+    ai_model_topic = any(token in topic_l for token in ["ai model", "foundation model", "llm", "large language", "model release", "model benchmark"])
+    if year >= 2026:
+        return 1.0
+    if year == 2025:
+        return 0.85
+    if year == 2024:
+        return 0.4 if ai_model_topic else 0.7
+    return 0.5
+
+
+def _domain_from_url(url: str) -> str:
+    try:
+        return (urlparse(url).netloc or "").lower().replace("www.", "")
+    except Exception:
+        return ""
+
+
+def _is_blog_domain(url: str) -> bool:
+    domain = _domain_from_url(url)
+    blog_markers = ["medium.com", "substack", "blog", "wordpress", "hashnode", "dev.to", "ghost.io"]
+    return any(marker in domain for marker in blog_markers)
+
+
+def _is_wikipedia_url(url: str) -> bool:
+    domain = _domain_from_url(url)
+    return "wikipedia.org" in domain
+
+
+def _is_self_benchmark_claim(claim: str) -> bool:
+    c = (claim or "").lower()
+    benchmark_markers = ["benchmark", "accuracy", "latency", "speed", "score", "bleu", "mmlu"]
+    self_markers = [
+        "self-reported",
+        "self validated",
+        "self-validated",
+        "our internal",
+        "we measured",
+        "in-house",
+        "according to company",
+        "company claims",
+        "press release",
+        "announced",
+    ]
+    return any(b in c for b in benchmark_markers) and any(s in c for s in self_markers)
+
+
+def _hyperbole_score(hook: str) -> float:
+    h = (hook or "").lower()
+    extreme = [
+        "just died",
+        "is dead",
+        "obliterated",
+        "game over",
+    ]
+    strong = [
+        "destroyed",
+        "everyone is wrong",
+        "nobody understands",
+    ]
+    mild = [
+        "always",
+        "never",
+    ]
+    if any(token in h for token in extreme):
+        return 1.0
+    if any(token in h for token in strong):
+        return 0.6
+    if any(token in h for token in mild):
+        return 0.3
+    return 0.0
+
+
+def _is_hyperbolic_hook(hook: str) -> bool:
+    return _hyperbole_score(hook) > 0.0
+
+
+def _claim_plausibility(claim: str) -> float:
+    text = (claim or "").strip().lower()
+    if not text:
+        return 0.4
+
+    score = 0.75
+
+    numbers = [float(n) for n in re.findall(r"\b\d+(?:\.\d+)?\b", text)]
+    percents = [float(n) for n in re.findall(r"\b(\d+(?:\.\d+)?)\s*%", text)]
+    if any(p > 200 for p in percents):
+        score -= 0.35
+    elif any(p > 100 for p in percents):
+        score -= 0.2
+    if any(n >= 1000 for n in numbers):
+        score -= 0.1
+
+    superiority_markers = [
+        "beats openai",
+        "better than gpt",
+        "outperforms gpt",
+        "best in the world",
+        "state-of-the-art",
+        "no one else",
+        "unmatched",
+    ]
+    if any(marker in text for marker in superiority_markers):
+        score -= 0.2
+
+    benchmark_context_markers = ["mmlu", "gsm8k", "bleu", "f1", "auc", "benchmark", "dataset", "eval", "latency"]
+    has_context = any(marker in text for marker in benchmark_context_markers)
+    mentions_comparison = any(token in text for token in ["beats", "better than", "outperforms", "faster than"])
+    if mentions_comparison and not has_context:
+        score -= 0.15
+
+    vague_markers = ["beats openai", "beats gpt", "faster than competitors", "better than everyone"]
+    if any(marker in text for marker in vague_markers):
+        score -= 0.15
+
+    return _clamp(score, 0.0, 1.0)
+
+
+def _compute_realism_components(verified_claims: list, hook_text: str) -> dict:
+    if verified_claims:
+        source_quality = sum(_safe_float(c.get("source_quality_weighted", c.get("source_quality", 0.0)), 0.0) for c in verified_claims) / max(len(verified_claims), 1)
+        independence = sum(_safe_float(c.get("independence_score", _independence_score(int(c.get("independent_sources", 0) or 0))), 0.4) for c in verified_claims) / max(len(verified_claims), 1)
+        recency = sum(_safe_float(c.get("recency", 0.5), 0.5) for c in verified_claims) / max(len(verified_claims), 1)
+        plausibility = sum(_safe_float(c.get("plausibility", 0.5), 0.5) for c in verified_claims) / max(len(verified_claims), 1)
+        non_self_benchmark = sum(_safe_float(c.get("non_self_benchmark", 0.3 if c.get("self_benchmark") else 1.0), 1.0) for c in verified_claims) / max(len(verified_claims), 1)
+    else:
+        source_quality = 0.3
+        independence = 0.4
+        recency = 0.5
+        plausibility = 0.4
+        non_self_benchmark = 0.5
+
+    non_hyperbolic = _clamp(1.0 - _hyperbole_score(hook_text), 0.0, 1.0)
+    realism_score = _clamp(
+        (0.25 * source_quality)
+        + (0.20 * independence)
+        + (0.15 * recency)
+        + (0.15 * plausibility)
+        + (0.15 * non_hyperbolic)
+        + (0.10 * non_self_benchmark),
+        0.0,
+        1.0,
+    )
+
+    return {
+        "source_quality": round(source_quality, 2),
+        "independence_score": round(independence, 2),
+        "recency": round(recency, 2),
+        "plausibility": round(plausibility, 2),
+        "non_hyperbolic": round(non_hyperbolic, 2),
+        "non_self_benchmark": round(non_self_benchmark, 2),
+        "realism_score": round(realism_score, 2),
+    }
+
+
+def _soften_absolutist_hook(hook: str) -> str:
+    text = (hook or "").strip()
+    if not text:
+        return text
+    replacements = {
+        " just died": " took a serious hit",
+        " is dead": " is losing ground",
+        " always ": " often ",
+        " never ": " rarely ",
+        "destroyed": "challenged",
+        "obliterated": "significantly weakened",
+        "game over": "a major turning point",
+    }
+    lowered = text.lower()
+    for k, v in replacements.items():
+        if k in lowered:
+            pattern = re.compile(re.escape(k), re.IGNORECASE)
+            text = pattern.sub(v, text)
+            lowered = text.lower()
+    return text
 
 
 # ==========================================
@@ -210,13 +539,20 @@ def input_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # NODE 2: STYLE MEMORY FETCH
 # ==========================================
 def style_memory_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Fetch user's previous posts from pgvector to match writing style."""
+    """
+    Fetch user's previous posts from pgvector to match writing style.
+    
+    Quality rules:
+    - Only memories with cosine distance <= STYLE_MAX_DISTANCE (0.35)
+    - Only past posts with distance <= STYLE_MAX_DISTANCE AND viral_score >= MIN_RETRIEVAL_SCORE
+    - Rerank with cross-encoder if available, else use distance ordering
+    """
     with NodeTimer("style_memory_fetch"):
         topic = state.get("topic", "")
         
         style_examples = []
 
-        # 1. Recall from general agent memory (past posts stored there)
+        # 1. Recall from general agent memory (strict distance filter)
         try:
             raw_memories = recall_memory(topic, limit=10)
             memory_strings = []
@@ -224,7 +560,8 @@ def style_memory_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 if isinstance(item, (tuple, list)) and len(item) >= 2:
                     content = str(item[0]).strip()
                     distance = float(item[1]) if item[1] else 1.0
-                    if content and distance <= 0.5:
+                    # STRICT: Only semantically close memories
+                    if content and distance <= MEMORY_MAX_DISTANCE:
                         memory_strings.append(content)
                 elif isinstance(item, str):
                     memory_strings.append(item.strip())
@@ -232,7 +569,7 @@ def style_memory_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
             # Use memory picker to select style-relevant memories
             if memory_strings:
                 picked = pick_memory_for_role(
-                    query=f"LinkedIn post style for: {topic}",
+                    query=f"LinkedIn writing style and voice for: {topic}",
                     memories=memory_strings,
                     role="writer",
                     k=3,
@@ -241,17 +578,22 @@ def style_memory_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             log_error("style_memory_fetch", f"Memory recall failed: {e}")
 
-        # 2. Also search past LinkedIn posts by similarity
+        # 2. Search past LinkedIn posts — STRICT: close match + high quality only
         try:
             query_embedding = embed_text(topic, is_query=True)
-            similar_posts = search_similar_posts(query_embedding, limit=5)
+            similar_posts = search_similar_posts(
+                query_embedding,
+                limit=5,
+                max_distance=STYLE_MAX_DISTANCE,
+                min_score=MIN_RETRIEVAL_SCORE,
+            )
             for post in similar_posts:
-                if post.get("content") and post["distance"] <= 0.6:
+                if post.get("content"):
                     style_examples.append(post["content"][:500])
         except Exception as e:
             log_error("style_memory_fetch", f"Post search failed: {e}")
 
-        log_state_update("style_memory_fetch", "style_examples", f"{len(style_examples)} examples found")
+        log_state_update("style_memory_fetch", "style_examples", f"{len(style_examples)} examples found (threshold: {STYLE_MAX_DISTANCE})")
         return {"style_examples": style_examples}
 
 
@@ -259,7 +601,14 @@ def style_memory_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # NODE 3: VIRAL POSTS FETCH
 # ==========================================
 def viral_posts_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Fetch viral post templates and high-performing past posts."""
+    """
+    Fetch viral post templates and high-performing past posts.
+    
+    Quality rules:
+    - Templates: distance <= VIRAL_MAX_DISTANCE (0.40)
+    - Past posts: viral_score >= 7.0 only
+    - Deduplicate by content similarity
+    """
     with NodeTimer("viral_posts_fetch"):
         topic = state.get("topic", "")
         viral_examples = []
@@ -267,8 +616,12 @@ def viral_posts_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
         try:
             query_embedding = embed_text(topic, is_query=True)
 
-            # 1. Search viral templates
-            templates = search_viral_templates(query_embedding, limit=5)
+            # 1. Search viral templates — distance-gated
+            templates = search_viral_templates(
+                query_embedding,
+                limit=5,
+                max_distance=VIRAL_MAX_DISTANCE,
+            )
             for t in templates:
                 if t.get("content"):
                     viral_examples.append({
@@ -276,9 +629,10 @@ def viral_posts_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
                         "hook_pattern": t.get("hook_pattern", ""),
                         "category": t.get("category", ""),
                         "score": t.get("engagement_score", 0),
+                        "distance": t.get("distance", 1.0),
                     })
 
-            # 2. Search high-scoring past posts
+            # 2. Search high-scoring past posts (>= 7.0 only)
             top_posts = get_top_posts(limit=5, min_score=7.0)
             for p in top_posts:
                 if p.get("content"):
@@ -292,63 +646,470 @@ def viral_posts_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             log_error("viral_posts_fetch", f"Viral fetch failed: {e}")
 
-        log_state_update("viral_posts_fetch", "viral_examples", f"{len(viral_examples)} examples found")
+        log_state_update("viral_posts_fetch", "viral_examples", f"{len(viral_examples)} examples found (dist<={VIRAL_MAX_DISTANCE})")
         return {"viral_examples": viral_examples}
 
 
 # ==========================================
-# NODE 4: TREND RESEARCH
+# NODE 4: TREND DISCOVERY (RAW SIGNALS)
 # ==========================================
-def trend_research_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Research current trends related to the topic using Tavily."""
-    with NodeTimer("trend_research"):
+def trend_discovery_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect raw trend signals from Tavily without LLM summarization."""
+    with NodeTimer("trend_discovery"):
         topic = state.get("topic", "")
-        trends = ""
+        previous_confidence = _safe_float(state.get("research_confidence", 1.0), 1.0)
+        retry_count = int(state.get("research_retry_count", 0) or 0)
+        if previous_confidence < 0.6:
+            retry_count += 1
+        current_month = time.strftime("%B %Y")
 
-        if _is_low_cost_mode():
-            trends = f"Low-cost mode enabled. Skipping web trend research for topic: {topic}"
-            log_state_update("trend_research", "trends", f"{len(trends)} chars (low-cost mode)")
-            return {"trends": trends}
+        queries = [
+            f"{topic} funding announcement {current_month}",
+            f"{topic} benchmark results {current_month}",
+            f"{topic} controversy {current_month}",
+            f"{topic} product launch {current_month}",
+            f"{topic} real world use case {current_month}",
+        ]
 
+        trend_candidates = []
+        seen_urls = set()
+
+        for query in queries:
+            result = tavily_search_structured(query=query, max_results=4)
+            for item in result.get("results", []):
+                url = (item.get("url") or "").strip()
+                title = (item.get("title") or "").strip()
+                snippet = (item.get("content") or "").strip()
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                if not snippet:
+                    continue
+                trend_candidates.append({
+                    "title": title,
+                    "source": url,
+                    "claim": snippet[:500],
+                    "date": item.get("published_date", ""),
+                    "confidence": 0.55,
+                    "query": query,
+                })
+
+        trend_candidates = trend_candidates[:15]
+        trend_blob = "\n".join(
+            [f"- {t.get('title', '')}: {t.get('claim', '')[:220]} ({t.get('source', '')})" for t in trend_candidates[:8]]
+        )
+
+        log_state_update("trend_discovery", "trend_candidates", f"{len(trend_candidates)} raw signals")
+        return {
+            "trend_candidates": trend_candidates,
+            "trends": trend_blob,
+            "research_retry_count": retry_count,
+        }
+
+
+# ==========================================
+# NODE 5: CLAIM EXTRACTION
+# ==========================================
+def claim_extraction_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract structured claims from raw trend candidates."""
+    with NodeTimer("claim_extraction"):
+        topic = state.get("topic", "")
+        trend_candidates = state.get("trend_candidates", [])
+
+        if not trend_candidates:
+            return {"extracted_claims": []}
+
+        candidates_text = "\n".join([
+            f"[{idx+1}] TITLE: {c.get('title','')}\nSOURCE: {c.get('source','')}\nTEXT: {c.get('claim','')}"
+            for idx, c in enumerate(trend_candidates[:12])
+        ])
+
+        prompt = f"""Extract factual claims for topic: {topic}
+
+INPUT SIGNALS:
+{candidates_text}
+
+Output JSON only:
+{{
+  "claims": [
+    {{
+      "claim": "...",
+      "type": "funding|performance|launch|controversy|adoption|opinion",
+      "verifiable": "strong|weak|no",
+      "source": "url",
+      "date": "date if available"
+    }}
+  ]
+}}
+
+Rules:
+- keep only concrete claims, no fluff
+- max 12 claims
+- preserve source url when possible
+"""
+
+        extracted_claims = []
         try:
-            # Search for current trends
-            current_month = time.strftime("%B %Y")
-
-            trend_query = f"LinkedIn trending topics {topic} {current_month}"
-            trend_results = tavily_search(trend_query, max_results=3)
-
-            angle_query = f"{topic} controversial takes insights tech industry {current_month}"
-            angle_results = tavily_search(angle_query, max_results=3)
-
-            # Synthesize trends using LLM
-            prompt = f"""Analyze these search results and extract:
-1. Current trends related to "{topic}"
-2. Relevant angles and perspectives
-3. Controversial or bold takes that would perform well on LinkedIn
-
-TREND SEARCH RESULTS:
-{trend_results}
-
-ANGLE SEARCH RESULTS:
-{angle_results}
-
-Return a concise summary with bullet points. Focus on actionable insights for writing a LinkedIn post.
-Keep it under 300 words. No fluff."""
-
             response = chat(
                 messages=[{"role": "user", "content": prompt}],
-                model=MODEL_TREND(),
-                options={"temperature": 0.3, "num_ctx": 4096},
+                model=MODEL_CLAIM_EXTRACT(),
+                options={"temperature": 0.1, "num_ctx": 8192},
             )
-
-            trends = _clean_think_tags(response)
-
+            parsed = _parse_json_from_llm(response)
+            extracted_claims = parsed.get("claims", []) if isinstance(parsed.get("claims", []), list) else []
         except Exception as e:
-            log_error("trend_research", f"Trend research failed: {e}")
-            trends = f"Could not fetch current trends. Topic: {topic}"
+            log_error("claim_extraction", f"Claim extraction failed: {e}")
 
-        log_state_update("trend_research", "trends", f"{len(trends)} chars")
-        return {"trends": trends}
+        # deterministic fallback extraction
+        if not extracted_claims:
+            for c in trend_candidates[:10]:
+                text = (c.get("claim") or "").strip()
+                if len(text) < 30:
+                    continue
+                extracted_claims.append({
+                    "claim": text[:260],
+                    "type": "adoption",
+                    "verifiable": "weak",
+                    "source": c.get("source", ""),
+                    "date": c.get("date", ""),
+                })
+
+        log_state_update("claim_extraction", "extracted_claims", f"{len(extracted_claims)} claims")
+        return {"extracted_claims": extracted_claims[:12]}
+
+
+# ==========================================
+# NODE 6: FACT VERIFICATION
+# ==========================================
+def fact_verification_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify extracted claims and compute research confidence."""
+    with NodeTimer("fact_verification"):
+        topic = state.get("topic", "")
+        extracted_claims = state.get("extracted_claims", [])
+        verified_claims = []
+
+        if not extracted_claims:
+            return {
+                "verified_claims": [],
+                "research_confidence": 0.0,
+                "research_retry_count": int(state.get("research_retry_count", 0) or 0),
+            }
+
+        for claim_obj in extracted_claims[:12]:
+            claim_text = (claim_obj.get("claim") or "").strip()
+            if not claim_text:
+                continue
+
+            verification_query = f"{claim_text} source news {topic}"
+            verification = tavily_search_structured(query=verification_query, max_results=4)
+            source_count = int(verification.get("count", 0) or 0)
+            top_results = verification.get("results", [])[:3]
+            source_urls = [r.get("url", "") for r in top_results if r.get("url")]
+            source_domains = [_domain_from_url(u) for u in source_urls if _domain_from_url(u)]
+            independent_sources = len(set(source_domains))
+
+            sq_scores = [_source_quality_from_url(r.get("url", "")) for r in top_results]
+            source_quality = round(sum(sq_scores) / max(len(sq_scores), 1), 2)
+            source_quality_weighted = round(_weighted_source_quality(source_quality, max(source_count, len(source_urls))), 2)
+            independence = _independence_score(independent_sources)
+            recency_scores = [_recency_score(r.get("published_date", ""), topic=topic) for r in top_results]
+            recency = round(sum(recency_scores) / max(len(recency_scores), 1), 2)
+            plausibility = _claim_plausibility(claim_text)
+            self_benchmark = _is_self_benchmark_claim(claim_text)
+            non_self_benchmark = 0.2 if self_benchmark else 1.0
+
+            verifiable = str(claim_obj.get("verifiable", "weak")).lower()
+            ver_boost = 0.05 if verifiable == "strong" else (0.02 if verifiable == "weak" else 0.0)
+            claim_confidence = _clamp(
+                (0.40 * source_quality_weighted)
+                + (0.20 * independence)
+                + (0.15 * recency)
+                + (0.15 * plausibility)
+                + (0.10 * non_self_benchmark)
+                + ver_boost,
+                0.0,
+                1.0,
+            )
+            truth_score = claim_confidence
+
+            entry = {
+                "claim": claim_text,
+                "type": claim_obj.get("type", "unknown"),
+                "source": claim_obj.get("source", ""),
+                "truth_score": round(truth_score, 2),
+                "source_quality": source_quality,
+                "source_quality_weighted": source_quality_weighted,
+                "independence_score": round(independence, 2),
+                "recency": recency,
+                "plausibility": round(plausibility, 2),
+                "claim_confidence": round(claim_confidence, 2),
+                "non_self_benchmark": round(non_self_benchmark, 2),
+                "source_count": source_count,
+                "independent_sources": independent_sources,
+                "source_urls": source_urls,
+                "blog_only": bool(source_urls) and all(_is_blog_domain(u) for u in source_urls),
+                "wikipedia_only": bool(source_urls) and all(_is_wikipedia_url(u) for u in source_urls),
+                "self_benchmark": self_benchmark,
+                "accepted": truth_score >= 0.6,
+            }
+            if entry["accepted"]:
+                verified_claims.append(entry)
+
+        avg_truth = round(sum(c["truth_score"] for c in verified_claims) / max(len(verified_claims), 1), 2) if verified_claims else 0.0
+        coverage = _clamp(len(verified_claims) / 5.0, 0.0, 1.0)
+        research_confidence = round(_clamp((0.6 * avg_truth) + (0.4 * coverage), 0.0, 1.0), 2)
+
+        try:
+            insert_research_snapshot(
+                topic=topic,
+                trend_candidates=state.get("trend_candidates", []),
+                extracted_claims=extracted_claims,
+                verified_claims=verified_claims,
+                research_confidence=research_confidence,
+            )
+        except Exception as e:
+            log_error("fact_verification", f"Persist research snapshot failed: {e}")
+
+        log_state_update("fact_verification", "verified_claims+research_confidence", f"{len(verified_claims)} verified, confidence={research_confidence}")
+        return {
+            "verified_claims": verified_claims,
+            "research_confidence": research_confidence,
+        }
+
+
+# ==========================================
+# NODE 6.5: CONTRADICTION ENGINE
+# ==========================================
+def contradiction_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Search for counter-claims and controversy signals to balance confirmation bias."""
+    with NodeTimer("contradiction"):
+        topic = state.get("topic", "")
+        verified_claims = state.get("verified_claims", [])
+        counter_claims = []
+        risk_flags = set()
+
+        if not verified_claims:
+            return {
+                "counter_claims": [],
+                "risk_flags": [],
+                "controversy_score": 0.0,
+                "confidence_adjustment": 0.0,
+            }
+
+        controversy_hits = 0
+        total_checks = 0
+        keyword_markers = ["criticism", "controversy", "debate", "backlash", "lawsuit", "regulator", "antitrust", "ethics", "bias", "safety", "recall"]
+
+        for claim_obj in verified_claims[:8]:
+            claim_text = (claim_obj.get("claim") or "").strip()
+            if not claim_text:
+                continue
+
+            queries = [
+                f"{claim_text} criticism",
+                f"{topic} controversy",
+                f"{claim_text} debate",
+            ]
+
+            for query in queries:
+                total_checks += 1
+                result = tavily_search_structured(query=query, max_results=3)
+                for item in result.get("results", [])[:3]:
+                    snippet = (item.get("content") or "").strip()
+                    title = (item.get("title") or "").strip()
+                    url = (item.get("url") or "").strip()
+                    if not snippet:
+                        continue
+
+                    text_blob = f"{title} {snippet}".lower()
+                    has_risk = any(marker in text_blob for marker in keyword_markers)
+                    if has_risk:
+                        controversy_hits += 1
+                        risk_flags.add("controversy")
+
+                    counter_claims.append({
+                        "claim": claim_text,
+                        "query": query,
+                        "title": title,
+                        "source": url,
+                        "snippet": snippet[:320],
+                        "date": item.get("published_date", ""),
+                        "domain": _domain_from_url(url),
+                        "risk_signal": has_risk,
+                    })
+
+        controversy_score = _clamp(controversy_hits / max(total_checks, 1), 0.0, 1.0)
+        if controversy_score >= 0.6:
+            confidence_adjustment = -0.2
+        elif controversy_score >= 0.3:
+            confidence_adjustment = -0.1
+        else:
+            confidence_adjustment = 0.0
+
+        research_confidence = _safe_float(state.get("research_confidence", 0.0), 0.0)
+        research_confidence = round(_clamp(research_confidence + confidence_adjustment, 0.0, 1.0), 2)
+
+        log_state_update(
+            "contradiction",
+            "counter_claims+controversy_score",
+            f"{len(counter_claims)} counters, controversy={controversy_score}",
+        )
+
+        return {
+            "counter_claims": counter_claims[:25],
+            "risk_flags": sorted(risk_flags),
+            "controversy_score": round(controversy_score, 2),
+            "confidence_adjustment": confidence_adjustment,
+            "research_confidence": research_confidence,
+        }
+
+
+# ==========================================
+# NODE 7: ANGLE BUILDER
+# ==========================================
+def angle_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a high-authority content angle from verified facts."""
+    with NodeTimer("angle_builder"):
+        topic = state.get("topic", "")
+        audience = state.get("audience", "tech professionals")
+        verified_claims = state.get("verified_claims", [])
+
+        if not verified_claims:
+            fallback = {
+                "best_angle": f"Most teams are underestimating the second-order impact of {topic}.",
+                "angle_type": "market_shift",
+                "supporting_facts": [],
+                "risk_level": "high",
+            }
+            return {"angle_package": fallback}
+
+        facts_blob = "\n".join([
+            f"- {c.get('claim')} (truth={c.get('truth_score')}, source_quality={c.get('source_quality')}, recency={c.get('recency')})"
+            for c in verified_claims[:8]
+        ])
+
+        prompt = f"""You are an elite thought-leadership strategist.
+Build a strong, defensible LinkedIn angle.
+
+TOPIC: {topic}
+AUDIENCE: {audience}
+
+VERIFIED FACTS:
+{facts_blob}
+
+Output JSON only:
+{{
+  "best_angle": "single sharp thesis",
+  "angle_type": "contrarian|founder_lesson|market_shift|tactical_insight|prediction",
+  "supporting_facts": ["fact1", "fact2", "fact3"],
+  "risk_level": "low|med|high"
+}}
+
+Rules:
+- Avoid absolutist language like "dead", "always", "never", "everyone", "nobody"
+- Prefer credible framing such as "took a serious hit", "is losing ground", "often", "many"
+ - If confidence is mixed, reflect uncertainty without becoming weak
+"""
+
+        angle_package = {}
+        try:
+            response = chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=MODEL_ANGLE(),
+                options={"temperature": 0.4, "num_ctx": 8192},
+            )
+            parsed = _parse_json_from_llm(response)
+            angle_package = {
+                "best_angle": parsed.get("best_angle", ""),
+                "angle_type": parsed.get("angle_type", "market_shift"),
+                "supporting_facts": parsed.get("supporting_facts", []),
+                "risk_level": parsed.get("risk_level", "med"),
+            }
+        except Exception as e:
+            log_error("angle_builder", f"Angle generation failed: {e}")
+
+        if not angle_package.get("best_angle"):
+            top_claims = [c.get("claim", "") for c in verified_claims[:3] if c.get("claim")]
+            angle_package = {
+                "best_angle": f"The real story in {topic} is execution quality, not headline hype.",
+                "angle_type": "founder_lesson",
+                "supporting_facts": top_claims,
+                "risk_level": "med",
+            }
+
+        log_state_update("angle_builder", "angle_package", f"{angle_package.get('angle_type', 'unknown')} | risk={angle_package.get('risk_level', 'med')}")
+        return {"angle_package": angle_package}
+
+
+# ==========================================
+# NODE 7.5: AUTHORITY POV BUILDER
+# ==========================================
+def pov_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate an insider POV to strengthen authority tone."""
+    with NodeTimer("pov_builder"):
+        topic = state.get("topic", "")
+        angle_package = state.get("angle_package", {})
+        risk_flags = state.get("risk_flags", [])
+        verified_claims = state.get("verified_claims", [])
+        controversy_score = _safe_float(state.get("controversy_score", 0.0), 0.0)
+
+        if _is_low_cost_mode():
+            pov_package = {
+                "founder_pov": f"If I were building in {topic}, I would optimize for verification, not headlines.",
+                "insider_framing": "Most public takes skip the tradeoffs that matter in production.",
+                "strong_stance": "The uncomfortable truth: credibility beats velocity when the stakes are real.",
+            }
+            return {"pov_package": pov_package}
+
+        facts_blob = "\n".join([f"- {c.get('claim', '')}" for c in verified_claims[:6]]) or "None"
+        angle_ctx = json.dumps(angle_package, ensure_ascii=False) if angle_package else "None"
+
+        prompt = f"""You are a top AI engineer writing a private memo.
+
+TOPIC: {topic}
+ANGLE: {angle_ctx}
+VERIFIED FACTS:
+{facts_blob}
+RISK FLAGS: {", ".join(risk_flags) if risk_flags else "none"}
+CONTROVERSY SCORE: {controversy_score}
+
+Answer with authoritative, insider tone:
+- What would a top AI engineer privately think about this?
+- What are they not saying publicly?
+- What is the uncomfortable truth?
+
+Return JSON only:
+{{
+  "founder_pov": "...",
+  "insider_framing": "...",
+  "strong_stance": "..."
+}}"""
+
+        pov_package = {}
+        try:
+            response = chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=MODEL_POV(),
+                options={"temperature": 0.5, "num_ctx": 4096},
+            )
+            parsed = _parse_json_from_llm(response)
+            pov_package = {
+                "founder_pov": parsed.get("founder_pov", ""),
+                "insider_framing": parsed.get("insider_framing", ""),
+                "strong_stance": parsed.get("strong_stance", ""),
+            }
+        except Exception as e:
+            log_error("pov_builder", f"POV generation failed: {e}")
+
+        if not pov_package.get("founder_pov"):
+            pov_package = {
+                "founder_pov": f"The real risk in {topic} is miscalibrated confidence, not missing a trend.",
+                "insider_framing": "Most teams do not talk about the operational debt these decisions create.",
+                "strong_stance": "The uncomfortable truth: without independent validation, you are just trading on hype.",
+            }
+
+        log_state_update("pov_builder", "pov_package", "insider framing added")
+        return {"pov_package": pov_package}
 
 
 # ==========================================
@@ -360,9 +1121,14 @@ def hook_generator_node(state: Dict[str, Any]) -> Dict[str, Any]:
         topic = state.get("topic", "")
         tone = state.get("tone", "professional")
         trends = state.get("trends", "")
+        verified_claims = state.get("verified_claims", [])
+        angle_package = state.get("angle_package", {})
+        pov_package = state.get("pov_package", {})
         style_examples = state.get("style_examples", [])
         viral_examples = state.get("viral_examples", [])
         include_emojis = state.get("include_emojis", False)
+        score_feedback = state.get("score_feedback", {})
+        iteration_count = int(state.get("iteration_count", 0) or 0)
 
         if _is_low_cost_mode():
             selected_hook = f"Here's what most people miss about {topic}."
@@ -382,10 +1148,27 @@ def hook_generator_node(state: Dict[str, Any]) -> Dict[str, Any]:
             viral_ctx = "None available"
 
         emoji_instruction = "Include relevant emojis where appropriate." if include_emojis else "Do NOT use any emojis."
+        claims_ctx = "\n".join([
+            f"- {c.get('claim', '')} (truth={c.get('truth_score', 0)}, recency={c.get('recency', 0)})"
+            for c in verified_claims[:6]
+        ]) or "None"
+        angle_ctx = json.dumps(angle_package, ensure_ascii=False) if angle_package else "None"
+        pov_ctx = json.dumps(pov_package, ensure_ascii=False) if pov_package else "None"
+        feedback_ctx = ""
+        if score_feedback:
+            weakest = ", ".join(score_feedback.get("weakest_dimensions", [])[:3])
+            suggestions = "\n".join([f"- {s}" for s in score_feedback.get("improvement_suggestions", [])[:5]])
+            feedback_ctx = f"""
+
+    ### PREVIOUS ITERATION FEEDBACK (must fix now):
+    Weakest dimensions: {weakest or 'N/A'}
+    Specific fixes:
+    {suggestions or '- Increase specificity and practical value'}
+    """
 
         prompt = f"""{MASTER_PROMPT}
 
-### TASK: Generate 5 LinkedIn post hooks
+### TASK: Generate 5 scroll-stopping LinkedIn hooks
 
 TOPIC: {topic}
 TONE: {tone}
@@ -394,38 +1177,69 @@ TONE: {tone}
 ### CURRENT TRENDS:
 {trends[:500]}
 
-### STYLE REFERENCES (user's past posts):
+### VERIFIED CLAIMS (use these, avoid unsupported stats):
+{claims_ctx}
+
+### ANGLE PACKAGE (prioritize this POV):
+{angle_ctx}
+
+### INSIDER POV (use this voice for authority):
+{pov_ctx}
+
+### STYLE REFERENCES (mirror this voice):
 {style_ctx}
 
-### VIRAL REFERENCES (high-performing posts):
+### VIRAL REFERENCES (learn these patterns):
 {viral_ctx}
 
-### INSTRUCTIONS:
-Generate exactly 5 hooks, one for each type:
-1. CURIOSITY — Makes reader stop scrolling to find out more
-2. AUTHORITY — Establishes instant credibility
-3. CONTRARIAN — Challenges conventional wisdom
-4. STORYTELLING — Opens with a compelling mini-narrative
-5. DEBATE — Sparks discussion and comments
+{feedback_ctx}
 
-For each hook, provide:
-- type: the hook type
-- text: the actual hook (2-3 lines max, LinkedIn formatted)
-- strength_score: 1-10 rating
+### HOOK TYPES TO GENERATE:
+1. CURIOSITY GAP — Create an information vacuum the reader MUST fill. 
+   Pattern: State an unexpected outcome, withhold the "how".
+   Example: "I mass-deleted 200 LinkedIn connections last month. My engagement tripled."
 
-Then select the BEST hook.
+2. AUTHORITY CLAIM — Lead with a specific credential or result that earns instant trust.
+   Pattern: Number + timeframe + result.
+   Example: "After mass-hiring 47 engineers in 6 months, here's what actually predicts success."
 
-Return ONLY valid JSON:
+3. CONTRARIAN STRIKE — Challenge a belief your audience holds sacred. Be bold, not reckless.
+   Pattern: "[Popular belief] is wrong. Here's the data."
+   Example: "Stop telling junior devs to 'just build projects.' It's the worst advice in tech."
+
+4. MICRO-STORY — Drop the reader into a vivid scene in 2 lines. Sensory details matter.
+   Pattern: Time + place + unexpected action.
+   Example: "My CTO called me at 2 AM. 'We're rolling back everything.' Here's what happened."
+
+5. POLARIZING QUESTION — Frame a genuine either/or that forces the reader to pick a side.
+   Pattern: Present two options where smart people disagree.
+   Example: "Unpopular opinion: 10x engineers don't exist. But 0.1x environments do."
+
+### SCORING EACH HOOK (be brutally honest):
+Rate each 1-10 where:
+- 1-3: Generic, forgettable, could be about anything
+- 4-5: Decent but won't stop the scroll
+- 6-7: Strong, specific, makes you want to read more
+- 8-9: Exceptional, would get shared
+- 10: Once-in-a-month viral hook
+
+DO NOT give every hook a 7. Most hooks are 4-6. Only rate 8+ if it's genuinely exceptional.
+
+### CREDIBILITY RULE:
+- Avoid absolutist/hyperbolic phrasing ("just died", "is dead", "always", "never", "everyone is wrong").
+- Use credible framing that remains strong but defensible.
+
+### OUTPUT (valid JSON only):
 {{
   "hooks": [
-    {{"type": "curiosity", "text": "...", "strength_score": 8}},
-    {{"type": "authority", "text": "...", "strength_score": 7}},
-    {{"type": "contrarian", "text": "...", "strength_score": 9}},
-    {{"type": "storytelling", "text": "...", "strength_score": 6}},
-    {{"type": "debate", "text": "...", "strength_score": 7}}
+    {{"type": "curiosity", "text": "...", "strength_score": 6.5}},
+    {{"type": "authority", "text": "...", "strength_score": 4.0}},
+    {{"type": "contrarian", "text": "...", "strength_score": 8.0}},
+    {{"type": "storytelling", "text": "...", "strength_score": 5.5}},
+    {{"type": "debate", "text": "...", "strength_score": 7.0}}
   ],
   "best_hook_index": 2,
-  "reason": "why this hook is best"
+  "reason": "This hook works because [specific reason tied to the topic and audience]"
 }}"""
 
         try:
@@ -437,7 +1251,71 @@ Return ONLY valid JSON:
 
             parsed = _parse_json_from_llm(response)
             hooks = parsed.get("hooks", [])
+            if not hooks and isinstance(parsed.get("items"), list):
+                hooks = parsed.get("items", [])
             best_idx = parsed.get("best_hook_index", 0)
+
+            # Handle non-JSON / malformed outputs common in local LLMs
+            if not hooks:
+                extracted = _extract_hook_candidates(response, topic)
+                hooks = [
+                    {"type": f"candidate_{idx + 1}", "text": text, "strength_score": 5.0}
+                    for idx, text in enumerate(extracted)
+                ]
+
+            # If model returns too few hooks, run compact recovery pass
+            if len(hooks) < 5:
+                recovery_prompt = f"""Generate exactly 5 LinkedIn hooks for topic: {topic}\n\nReturn valid JSON only in this shape:\n{{\"hooks\":[\"hook 1\",\"hook 2\",\"hook 3\",\"hook 4\",\"hook 5\"]}}\n\nRules:\n- each hook 8-18 words\n- no intro text\n- no markdown\n- no emojis"""
+                recovery_raw = chat(
+                    messages=[{"role": "user", "content": recovery_prompt}],
+                    model=MODEL_HOOK_GEN(),
+                    options={"temperature": 0.6, "num_ctx": 2048},
+                )
+                recovered = _parse_json_from_llm(recovery_raw)
+                recovered_hooks = recovered.get("hooks", [])
+                if isinstance(recovered_hooks, list) and recovered_hooks:
+                    merged = []
+                    for item in recovered_hooks:
+                        if isinstance(item, str):
+                            merged.append({"type": "recovered", "text": item, "strength_score": 5.0})
+                        elif isinstance(item, dict):
+                            merged.append({
+                                "type": item.get("type", "recovered"),
+                                "text": item.get("text", ""),
+                                "strength_score": item.get("strength_score", 5.0),
+                            })
+                    hooks.extend([h for h in merged if h.get("text")])
+
+            # Final cleanup + dedupe + cap
+            normalized = []
+            seen = set()
+            for hook in hooks:
+                if isinstance(hook, str):
+                    hook = {"type": "candidate", "text": hook, "strength_score": 5.0}
+                text = (hook.get("text", "") or "").strip()
+                if not text:
+                    continue
+                key = re.sub(r"\W+", "", text.lower())
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                normalized.append({
+                    "type": hook.get("type", "candidate"),
+                    "text": text,
+                    "strength_score": float(hook.get("strength_score", 5.0)),
+                })
+
+            if len(normalized) < 5:
+                extracted = _extract_hook_candidates(response, topic)
+                for text in extracted:
+                    key = re.sub(r"\W+", "", text.lower())
+                    if key not in seen:
+                        normalized.append({"type": "fallback", "text": text, "strength_score": 5.0})
+                        seen.add(key)
+                    if len(normalized) >= 5:
+                        break
+
+            hooks = normalized[:5]
 
             if hooks and 0 <= best_idx < len(hooks):
                 selected_hook = hooks[best_idx].get("text", "")
@@ -449,13 +1327,16 @@ Return ONLY valid JSON:
                 selected_hook = f"Here's something most people get wrong about {topic}."
                 hooks = [{"type": "fallback", "text": selected_hook, "strength_score": 5}]
 
+            selected_hook = _soften_absolutist_hook(selected_hook)
+
         except Exception as e:
             log_error("hook_generator", f"Hook generation failed: {e}")
             selected_hook = f"Here's something most people get wrong about {topic}."
             hooks = [{"type": "fallback", "text": selected_hook, "strength_score": 5}]
 
-        log_state_update("hook_generator", "hooks+selected_hook", f"{len(hooks)} hooks, best: {selected_hook[:50]}...")
-        return {"hooks": hooks, "selected_hook": selected_hook}
+        next_iteration = iteration_count + 1
+        log_state_update("hook_generator", "hooks+selected_hook", f"iter {next_iteration}: {len(hooks)} hooks, best: {selected_hook[:50]}...")
+        return {"hooks": hooks, "selected_hook": selected_hook, "iteration_count": next_iteration}
 
 
 # ==========================================
@@ -471,9 +1352,36 @@ def post_writer_node(state: Dict[str, Any]) -> Dict[str, Any]:
         include_emojis = state.get("include_emojis", False)
         selected_hook = state.get("selected_hook", "")
         trends = state.get("trends", "")
+        verified_claims = state.get("verified_claims", [])
+        angle_package = state.get("angle_package", {})
+        pov_package = state.get("pov_package", {})
         style_examples = state.get("style_examples", [])
         viral_examples = state.get("viral_examples", [])
         hooks = state.get("hooks", [])
+        score_feedback = state.get("score_feedback", {})
+
+        realism = _compute_realism_components(verified_claims, selected_hook)
+        if realism.get("realism_score", 0.0) < 0.6:
+            log_error("realism_check", f"FAILED: Score {realism.get('realism_score')} is too low.")
+            thought_piece = {
+                "hook": selected_hook or f"Most people talk about {topic} outcomes, not evidence.",
+                "post": (
+                    f"{selected_hook or f'Most people talk about {topic} outcomes, not evidence.'}\n\n"
+                    f"There is a real signal here, but the public data is still thin.\n\n"
+                    "If I were advising a team, I would pause before repeating numbers we cannot verify.\n\n"
+                    "The uncomfortable truth: credibility compounds slower than hype, but it wins.\n\n"
+                    "Have you ever held back a hot take because the evidence was not strong enough?"
+                ),
+                "cta": "Have you ever held back a hot take because the evidence was not strong enough?",
+                "hashtags": ["#Leadership", "#AI"],
+                "viral_score_prediction": 4.0,
+                "reasoning": "Low realism score triggered thought-piece fallback to avoid unsupported claims.",
+            }
+            return {
+                "generated_post": thought_piece,
+                "approval_status": "rejected",
+                "error": f"rejected_due_to_low_realism:{realism.get('realism_score')}",
+            }
 
         # Build context blocks
         style_ctx = "\n".join([f"- {s[:300]}" for s in style_examples[:3]]) if style_examples else "None"
@@ -492,6 +1400,23 @@ def post_writer_node(state: Dict[str, Any]) -> Dict[str, Any]:
         ]) if hooks else "None"
 
         emoji_instruction = "Include relevant emojis where they add value." if include_emojis else "Do NOT use any emojis."
+        claims_ctx = "\n".join([
+            f"- {c.get('claim', '')} (truth={c.get('truth_score', 0)}, source_quality={c.get('source_quality', 0)}, recency={c.get('recency', 0)})"
+            for c in verified_claims[:8]
+        ]) or "None"
+        angle_ctx = json.dumps(angle_package, ensure_ascii=False) if angle_package else "None"
+        pov_ctx = json.dumps(pov_package, ensure_ascii=False) if pov_package else "None"
+        feedback_ctx = ""
+        if score_feedback:
+            weakest = ", ".join(score_feedback.get("weakest_dimensions", [])[:4])
+            suggestions = "\n".join([f"- {s}" for s in score_feedback.get("improvement_suggestions", [])[:6]])
+            feedback_ctx = f"""
+
+    ### MANDATORY FIXES FROM PREVIOUS SCORE:
+    Weakest dimensions: {weakest or 'N/A'}
+    Apply these fixes explicitly:
+    {suggestions or '- Improve specificity, value density, and CTA quality'}
+    """
 
         prompt = f"""{MASTER_PROMPT}
 
@@ -499,45 +1424,80 @@ def post_writer_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 TOPIC: {topic}
 TONE: {tone}
-AUDIENCE: {audience}
-GOAL: {goal}
+TARGET AUDIENCE: {audience}
+PRIMARY GOAL: {goal}
 {emoji_instruction}
 
-### SELECTED HOOK (use this as the opening):
+### SELECTED HOOK (start with this — you may refine it slightly):
 {selected_hook}
 
-### CURRENT TRENDS:
+### CURRENT TRENDS (weave in naturally, don't force):
 {trends[:500]}
 
-### STYLE REFERENCES (match this writing style):
+### VERIFIED FACTS (MUST anchor claims to these):
+{claims_ctx}
+
+### STRATEGIC ANGLE (follow this thesis):
+{angle_ctx}
+
+### INSIDER POV (tone authority from this):
+{pov_ctx}
+
+### STYLE REFERENCES (match this voice and rhythm):
 {style_ctx}
 
-### VIRAL REFERENCES (learn from these):
+### VIRAL REFERENCES (learn structural patterns, don't copy):
 {viral_ctx}
 
-### ALL GENERATED HOOKS (for reference):
+### ALL HOOKS GENERATED (for additional inspiration):
 {hooks_ctx}
 
-### OUTPUT FORMAT:
-Return ONLY valid JSON. No other text.
+{feedback_ctx}
 
+### POST STRUCTURE TO FOLLOW:
+1. HOOK (lines 1-2): The selected hook. Must work in LinkedIn preview (first ~210 chars visible before "...see more").
+2. TENSION (lines 3-6): Build the problem, story, or counterintuitive setup. Create a gap between what the reader believes and what's true.
+3. INSIGHT (lines 7-12): Deliver the core value. Be specific — use numbers, names, timelines, real examples. This is where you earn the save/bookmark.
+4. PROOF/STORY (lines 13-16): One concrete example, case study, or personal experience that validates the insight. "I did X → Y happened."
+5. CTA (last 2 lines): Ask a SPECIFIC question tied to the content. Not "What do you think?" but "Have you ever [specific scenario]? How did you handle it?"
+6. KNOWLEDGE + EMOTION: Include at least one concrete fact/metric/tool/company and at least one emotional sentence (frustration, fear, relief, conviction, excitement).
+7. TAKEAWAY: Include one practical mini-framework/list of exactly 3 short points in the second half of the post.
+
+### FORMATTING RULES:
+- Target 180-260 words total (hard minimum 170, hard maximum 280)
+- Single blank line between every paragraph
+- Paragraphs: 1-3 sentences max
+- No bullet points in the first half
+- Hashtags: exactly 2-3, placed at the very end after a blank line
+
+### REALISM RULES:
+- Do not invent funding numbers, benchmark values, or named partnerships not present in VERIFIED FACTS
+- If evidence is weak, express uncertainty explicitly
+
+### SELF-CHECK BEFORE RESPONDING:
+Before writing your JSON output, mentally verify:
+□ Does line 1 create a curiosity gap or pattern interrupt?
+□ Would you personally stop scrolling for this?
+□ Is there at least one specific number, name, or data point?
+□ Does the CTA ask something people will WANT to answer?
+□ Is it under 280 words?
+
+### OUTPUT FORMAT (valid JSON only):
 {{
-  "hook": "the opening 1-2 lines that grab attention",
-  "post": "the FULL post body including hook, main content, and CTA. Use \\n for line breaks. Format for LinkedIn (short paragraphs, line breaks between ideas).",
-  "cta": "the closing call-to-action question or statement",
-  "hashtags": ["hashtag1", "hashtag2", "hashtag3"],
-  "viral_score_prediction": 7.5,
-  "reasoning": "brief explanation of why this post will perform well"
+  "hook": "the opening 1-2 lines verbatim",
+  "post": "the FULL post body including hook through CTA. Use \\n for line breaks.",
+  "cta": "the closing call-to-action (also included at end of post field)",
+  "hashtags": ["hashtag1", "hashtag2"],
+  "viral_score_prediction": 6.0,
+  "reasoning": "2-3 sentences: What specific elements make this post strong or weak? Be honest."
 }}
 
-CRITICAL RULES:
-- The post MUST start with the selected hook
-- Use short paragraphs (1-3 sentences each)
-- Add blank lines between paragraphs for LinkedIn formatting
-- The CTA should invite comments or saves
-- Hashtags should be 3-5, relevant, and not overly generic
-- viral_score_prediction should be honest (not always high)
-- reasoning should reference specific elements that drive engagement"""
+IMPORTANT: viral_score_prediction must be your HONEST assessment:
+- 3-4: Decent but forgettable
+- 5-6: Solid, will get some engagement  
+- 7-8: Strong, likely to go semi-viral
+- 9-10: Exceptional (rate this only if you genuinely believe it)
+Do NOT default to 7.5. Most posts are 5-6."""
 
         try:
             response = chat(
@@ -558,6 +1518,51 @@ CRITICAL RULES:
             generated_post.setdefault("hashtags", [])
             generated_post.setdefault("viral_score_prediction", 5.0)
             generated_post.setdefault("reasoning", "")
+
+            # Local LLM guardrail: enforce minimum depth and non-generic CTA
+            current_post = generated_post.get("post", "")
+            wc = _word_count(current_post)
+
+            if wc < 170 or _is_generic_cta(generated_post.get("cta", "")):
+                expand_prompt = f"""Improve this LinkedIn draft without changing its core idea.
+
+Requirements:
+- Final length: 180-260 words
+- Keep same hook theme
+- Add one concrete metric/company/tool reference
+- Add one emotional sentence
+- Add one 3-point practical takeaway in second half
+- Replace generic CTA with specific either/or or fill-in-the-blank CTA
+- Keep mobile-friendly short paragraphs
+
+Return valid JSON only:
+{{
+  "hook": "...",
+  "post": "...",
+  "cta": "...",
+  "hashtags": ["...", "..."],
+  "viral_score_prediction": 6.0,
+  "reasoning": "..."
+}}
+
+Current draft:
+{json.dumps(generated_post, ensure_ascii=False)}"""
+
+                expanded_raw = chat(
+                    messages=[{"role": "user", "content": expand_prompt}],
+                    model=MODEL_WRITER(),
+                    options={"temperature": 0.5, "num_ctx": 8192},
+                )
+                expanded = _parse_json_from_llm(expanded_raw)
+                if expanded.get("post") and _word_count(expanded.get("post", "")) >= 170:
+                    generated_post.update({
+                        "hook": expanded.get("hook", generated_post.get("hook", selected_hook)),
+                        "post": expanded.get("post", generated_post.get("post", "")),
+                        "cta": expanded.get("cta", generated_post.get("cta", "")),
+                        "hashtags": expanded.get("hashtags", generated_post.get("hashtags", [])),
+                        "viral_score_prediction": expanded.get("viral_score_prediction", generated_post.get("viral_score_prediction", 5.0)),
+                        "reasoning": expanded.get("reasoning", generated_post.get("reasoning", "")),
+                    })
 
         except Exception as e:
             log_error("post_writer", f"Post writing failed: {e}")
@@ -588,6 +1593,7 @@ def engagement_optimizer_node(state: Dict[str, Any]) -> Dict[str, Any]:
         original_post = generated_post.get("post", "")
         original_cta = generated_post.get("cta", "")
         original_hook = generated_post.get("hook", "")
+        score_feedback = state.get("score_feedback", {})
 
         if _is_low_cost_mode():
             optimized = generated_post.copy()
@@ -597,45 +1603,75 @@ def engagement_optimizer_node(state: Dict[str, Any]) -> Dict[str, Any]:
             return {"optimized_post": optimized}
 
         emoji_instruction = "Add 1-2 relevant emojis per section if they add value." if include_emojis else "Remove ALL emojis if any exist."
+        scorer_feedback_block = ""
+        if score_feedback:
+            weakest = ", ".join(score_feedback.get("weakest_dimensions", [])[:4])
+            suggestions = "\n".join([f"- {s}" for s in score_feedback.get("improvement_suggestions", [])[:6]])
+            scorer_feedback_block = f"""
+
+    ### SCORER FEEDBACK TO FIX (MANDATORY)
+    Weakest dimensions: {weakest or 'N/A'}
+    {suggestions or '- Improve specificity and save-worthy value'}
+    """
 
         prompt = f"""{MASTER_PROMPT}
 
-### TASK: Optimize this LinkedIn post for maximum engagement
+### TASK: Optimize this LinkedIn post — you are the final editor before publishing
 
 TONE: {tone}
 AUDIENCE: {audience}
 
-### CURRENT POST:
+### CURRENT DRAFT:
 HOOK: {original_hook}
 
-POST BODY:
+BODY:
 {original_post}
 
 CTA: {original_cta}
 
-### OPTIMIZATION AREAS:
-1. READABILITY — Ensure short paragraphs, proper line breaks, scannable format
-2. HOOK STRENGTH — Make the first 2 lines even more compelling
-3. CTA POWER — Make the call-to-action irresistible (provoke comments/saves)
-4. PUNCHLINES — Add 1-2 punchy one-liners that are quotable/saveable
-5. COMMENT BAIT — Ensure at least one statement that compels people to respond
-6. SPACING — Optimize for mobile LinkedIn reading (short lines, breaks)
-7. FLOW — Ensure smooth transitions between ideas
+### YOUR EDITING CHECKLIST (apply each ruthlessly):
+
+1. **HOOK AUDIT**: Does line 1 work in the LinkedIn preview (~210 chars)? Would YOU stop scrolling? If not, sharpen it.
+
+2. **FILLER ELIMINATION**: Read every sentence. If removing it doesn't lose meaning → cut it. Target words: "actually", "really", "basically", "just", "very", "In order to".
+
+3. **SPECIFICITY INJECTION**: Replace vague claims with concrete ones.
+   BAD: "I've seen many companies struggle with this"
+   GOOD: "3 of the 5 startups I advised last year failed because of this exact pattern"
+
+4. **RHYTHM CHECK**: Read it aloud mentally. Alternate between:
+   - Short punch (3-7 words)
+   - Medium explanation (10-20 words)
+   Break any sentence longer than 25 words into two.
+
+5. **CTA UPGRADE**: The call-to-action must be an EITHER/OR or FILL-IN-THE-BLANK that people can answer in one sentence.
+   BAD: "What do you think?"
+   GOOD: "What's the one tool you'd refuse to give up, even if your company switched stacks?"
+
+6. **MOBILE FORMAT**: Every paragraph ≤ 3 lines on mobile (~45 chars/line). Add line breaks if needed.
+
+7. **COMMENT BAIT**: Ensure at least ONE statement that 30% of readers will disagree with. Disagreement = comments = reach.
+
+8. **DEPTH + LENGTH**: Final output must be 180-260 words and include:
+    - one concrete stat/company/tool
+    - one emotional sentence
+    - one practical 3-point takeaway
+
+{scorer_feedback_block}
+
 {emoji_instruction}
 
-### OUTPUT FORMAT:
-Return ONLY valid JSON with the optimized version:
-
+### OUTPUT FORMAT (valid JSON only):
 {{
   "hook": "optimized hook",
   "post": "full optimized post with \\n line breaks",
   "cta": "optimized CTA",
   "hashtags": {json.dumps(generated_post.get("hashtags", []))},
   "viral_score_prediction": {generated_post.get("viral_score_prediction", 5.0)},
-  "reasoning": "what was improved and why it will perform better"
+  "reasoning": "What exactly did you change and why? Be specific: 'Shortened hook from 18 to 9 words. Replaced generic CTA with either/or format. Cut 2 filler sentences.'"
 }}
 
-RULE: Keep the core message and voice intact. Only improve structure, impact, and engagement potential."""
+CRITICAL: Keep the author's core message and voice. You are editing, not rewriting from scratch. If the draft is already strong, make minimal changes and explain why."""
 
         try:
             response = chat(
@@ -660,114 +1696,442 @@ RULE: Keep the core message and voice intact. Only improve structure, impact, an
             optimized = generated_post.copy()
             optimized["reasoning"] = f"Optimization failed ({e}) — kept original"
 
+        # Final safety net for short or generic local outputs
+        if _word_count(optimized.get("post", "")) < 170 or _is_generic_cta(optimized.get("cta", "")):
+            optimized["reasoning"] = (
+                (optimized.get("reasoning", "") + "\n\n")
+                + "Post may be too short or CTA too generic after optimization; scorer will request self-correction."
+            ).strip()
+
         log_state_update("engagement_optimizer", "optimized_post", "post optimized")
         return {"optimized_post": optimized}
 
 
 # ==========================================
-# NODE 8: VIRAL SCORER
+# NODE 8: VIRAL SCORER (10-DIMENSION RUBRIC)
 # ==========================================
 def viral_scorer_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Independently score the post's viral potential (0-10)."""
+    """
+    Independently score the post's viral potential using a 10-dimension rubric.
+    
+    Each dimension scored 0-1 (total 0-10).
+    Includes anti-anchoring instructions to prevent LLMs defaulting to middle scores.
+    If score < 6.0, generates specific improvement suggestions for self-correction.
+    """
     with NodeTimer("viral_scorer"):
         optimized_post = state.get("optimized_post", {})
         topic = state.get("topic", "")
         trends = state.get("trends", "")
         viral_examples = state.get("viral_examples", [])
+        verified_claims = state.get("verified_claims", [])
 
         post_text = optimized_post.get("post", "")
         hook_text = optimized_post.get("hook", "")
+        cta_text = optimized_post.get("cta", "")
 
         if _is_low_cost_mode():
-            heuristic_score = 5.0
-            if hook_text:
-                heuristic_score += 0.5
-            if len(post_text) > 250:
-                heuristic_score += 0.5
-            heuristic_score = max(0.0, min(10.0, heuristic_score))
+            # Heuristic scoring with more variance
+            score = 0.0
+            words = post_text.split()
+            lines = post_text.split("\n")
+
+            # Hook present and punchy (< 15 words in first line)
+            first_line_words = lines[0].split() if lines else []
+            if hook_text and len(first_line_words) <= 15:
+                score += 0.8
+            elif hook_text:
+                score += 0.4
+
+            # Length sweet spot (150-280 words)
+            wc = len(words)
+            if 150 <= wc <= 280:
+                score += 0.9
+            elif 100 <= wc <= 350:
+                score += 0.5
+            else:
+                score += 0.2
+
+            # Has specific numbers/data
+            import re as _re
+            if _re.search(r'\d+%|\$\d|\d{2,}', post_text):
+                score += 0.8
+            else:
+                score += 0.2
+
+            # Paragraph rhythm (short paragraphs)
+            paragraphs = [p for p in post_text.split("\n\n") if p.strip()]
+            avg_para_len = sum(len(p.split()) for p in paragraphs) / max(len(paragraphs), 1)
+            if avg_para_len <= 30:
+                score += 0.7
+            else:
+                score += 0.3
+
+            # CTA present and specific
+            if cta_text and "?" in cta_text:
+                score += 0.7
+            elif cta_text:
+                score += 0.3
+            else:
+                score += 0.1
+
+            # Hashtags reasonable (2-3)
+            ht = optimized_post.get("hashtags", [])
+            if 2 <= len(ht) <= 3:
+                score += 0.6
+            else:
+                score += 0.3
+
+            # No filler phrases
+            filler = ["in today's", "game-changer", "let's dive in", "here's the thing"]
+            if not any(f in post_text.lower() for f in filler):
+                score += 0.7
+            else:
+                score += 0.1
+
+            # First-person voice
+            if any(w in post_text.lower().split() for w in ["i", "i've", "my", "i'm", "we"]):
+                score += 0.6
+            else:
+                score += 0.2
+
+            # Trend relevance (basic keyword check)
+            topic_words = set(topic.lower().split())
+            if any(tw in post_text.lower() for tw in topic_words if len(tw) > 3):
+                score += 0.5
+            else:
+                score += 0.2
+
+            # Controversy/opinion signal
+            opinion_signals = ["wrong", "stop", "never", "most people", "unpopular", "nobody talks"]
+            if any(s in post_text.lower() for s in opinion_signals):
+                score += 0.7
+            else:
+                score += 0.3
+
+            # Realism score (source-backed and non-hype)
+            verified_fact_count = len(verified_claims)
+            if verified_fact_count >= 3:
+                score += 0.8
+            elif verified_fact_count >= 1:
+                score += 0.5
+            else:
+                score += 0.2
+
+            # Hyperbolic hook penalty (credibility)
+            score -= round(_hyperbole_score(hook_text) * 0.3, 2)
+
+            score = round(max(0.0, min(10.0, score)), 1)
 
             optimized = optimized_post.copy()
-            optimized["viral_score_prediction"] = heuristic_score
-            existing_reasoning = optimized.get("reasoning", "")
-            optimized["reasoning"] = (
-                (existing_reasoning + "\n\n") if existing_reasoning else ""
-            ) + "Viral score estimated in low-cost mode (heuristic, no scorer LLM call)."
+            optimized["viral_score_prediction"] = score
+            optimized["reasoning"] = f"Heuristic score: {score}/10 (low-cost mode)"
+            optimized.setdefault("score_breakdown", {})
+            optimized["score_breakdown"]["realism_score"] = _compute_realism_components(verified_claims, hook_text).get("realism_score", 0.3)
 
-            log_state_update("viral_scorer", "viral_score", f"{heuristic_score}/10 (low-cost mode)")
-            return {"optimized_post": optimized, "viral_score": heuristic_score}
+            log_state_update("viral_scorer", "viral_score", f"{score}/10 (low-cost heuristic)")
+            return {
+                "optimized_post": optimized,
+                "viral_score": score,
+                "realism_score": optimized["score_breakdown"]["realism_score"],
+            }
 
-        # Compare with past high-performers
+        # Compare with past high-performers — strict distance
         similarity_context = ""
         try:
             post_embedding = embed_text(post_text, is_query=True)
-            similar = search_similar_posts(post_embedding, limit=3)
+            similar = search_similar_posts(
+                post_embedding,
+                limit=3,
+                max_distance=SIMILAR_MAX_DISTANCE,
+                min_score=MIN_RETRIEVAL_SCORE,
+            )
             for s in similar:
-                similarity_context += f"- Similar post (score: {s.get('viral_score', 'N/A')}, distance: {s.get('distance', 'N/A'):.3f}): {s.get('content', '')[:200]}\n"
+                similarity_context += f"- Past post (score: {s.get('viral_score', 'N/A')}, distance: {s.get('distance', 'N/A'):.3f}): {s.get('content', '')[:200]}\n"
         except Exception as e:
             log_error("viral_scorer", f"Similarity search failed: {e}")
-            similarity_context = "No past data available"
+            similarity_context = "No comparable past data available."
 
-        prompt = f"""You are a LinkedIn viral content scoring algorithm.
+        prompt = f"""You are a LinkedIn content scoring algorithm. You must NOT default to middle scores.
 
-Score this post from 0 to 10 based on these criteria:
-
-### POST TO SCORE:
+### POST TO EVALUATE:
 HOOK: {hook_text}
 
 FULL POST:
 {post_text}
 
-### SCORING CRITERIA (each out of 2 points, total 10):
-1. HOOK STRENGTH (0-2): Does the first line stop the scroll?
-2. CLARITY (0-2): Is the message clear and easy to follow?
-3. TREND RELEVANCE (0-2): Does it tap into current conversations?
-4. ENGAGEMENT POTENTIAL (0-2): Will people comment, share, or save?
-5. AUTHENTICITY (0-2): Does it sound human, opinionated, and real?
+CTA: {cta_text}
 
-### CONTEXT:
-Current trends: {trends[:300]}
-Similar past posts: {similarity_context if similarity_context else "No past data"}
+### 11-DIMENSION SCORING RUBRIC (each dimension: 0.0 to 1.0)
 
-### OUTPUT FORMAT:
-Return ONLY valid JSON:
+Score each dimension independently. Think step-by-step for each one.
 
+1. **SCROLL-STOP POWER** (0.0-1.0): Will the first line make someone STOP scrolling?
+   0.0 = Generic opener anyone could write
+   0.5 = Interesting but not urgent
+   1.0 = Physically impossible to not click "see more"
+
+2. **SPECIFICITY** (0.0-1.0): Does the post contain concrete details?
+   0.0 = All vague generalizations
+   0.5 = Some specific claims but unverified
+   1.0 = Named companies, exact numbers, real timelines
+
+3. **EMOTIONAL RESONANCE** (0.0-1.0): Does it make the reader FEEL something?
+   0.0 = Reads like a Wikipedia article
+   0.5 = Mildly interesting
+   1.0 = Reader feels frustration, excitement, vindication, or surprise
+
+4. **STRUCTURAL FLOW** (0.0-1.0): Is it formatted for mobile LinkedIn?
+   0.0 = Wall of text, long paragraphs
+   0.5 = Some formatting but inconsistent
+   1.0 = Perfect rhythm: short punches + breathing room
+
+5. **VOICE AUTHENTICITY** (0.0-1.0): Does it sound like a REAL person?
+   0.0 = Obviously AI-generated, corporate fluff
+   0.5 = Decent but could be anyone
+   1.0 = Distinctive voice, you'd recognize the author
+
+6. **COMMENT MAGNETISM** (0.0-1.0): Will people NEED to respond?
+   0.0 = Nothing to disagree with or add to
+   0.5 = Some might comment
+   1.0 = Contains a statement that splits the audience 50/50
+
+7. **SAVE-WORTHY VALUE** (0.0-1.0): Would someone bookmark this?
+   0.0 = No actionable insight
+   0.5 = Interesting but not reference-worthy
+   1.0 = Contains a framework, checklist, or insight worth revisiting
+
+8. **TREND CURRENCY** (0.0-1.0): Is it timely and relevant?
+   0.0 = Could have been written 5 years ago
+   0.5 = Generally relevant
+   1.0 = Tied to something happening RIGHT NOW
+
+9. **CTA EFFECTIVENESS** (0.0-1.0): Will the closing drive action?
+   0.0 = No CTA or generic "thoughts?"
+   0.5 = Decent question but easy to ignore
+   1.0 = Specific dilemma that people want to weigh in on
+
+10. **SHAREABILITY** (0.0-1.0): Would someone repost this?
+    0.0 = Too niche or too generic
+    0.5 = Good content but no share trigger
+    1.0 = Makes the sharer look smart/insightful
+
+11. **REALISM_SCORE** (0.0-1.0): Is it believable and source-consistent?
+    0.0 = Contains likely fabricated or unsupported claims
+    0.5 = Mostly plausible but partially weakly supported
+    1.0 = Claims are grounded, specific, and believable
+
+### PAST COMPARISON:
+{similarity_context if similarity_context else "No comparable past data."}
+
+### ANTI-ANCHORING INSTRUCTIONS:
+- Do NOT start from 5.0 and adjust. Score each dimension from scratch.
+- The distribution should be VARIED: some dimensions will be 0.2, others 0.9.
+- A truly average LinkedIn post scores 3.0-4.5 total. A good one scores 5.5-7.0. Viral = 8.0+.
+- If all your subscores cluster around 0.5-0.7, you are being lazy. Spread them out.
+- First compute raw_sum = SUM of all 11 dimensions (max 11.0)
+- Then normalize to /10 using: viral_score = (raw_sum / 11) * 10
+
+### OUTPUT (valid JSON only):
 {{
-  "viral_score": 7.5,
+  "scoring_reasoning": "2-3 sentences of chain-of-thought BEFORE scoring. What stands out? What's weak?",
   "breakdown": {{
-    "hook_strength": 1.8,
-    "clarity": 1.5,
-    "trend_relevance": 1.2,
-    "engagement_potential": 1.5,
-    "authenticity": 1.5
+    "scroll_stop_power": 0.7,
+    "specificity": 0.3,
+    "emotional_resonance": 0.8,
+    "structural_flow": 0.6,
+    "voice_authenticity": 0.5,
+    "comment_magnetism": 0.9,
+    "save_worthy_value": 0.4,
+    "trend_currency": 0.7,
+    "cta_effectiveness": 0.6,
+        "shareability": 0.5,
+        "realism_score": 0.7
   }},
-  "reasoning": "brief explanation of the score"
-}}
-
-BE HONEST. Not every post is a 9/10. Average LinkedIn posts score 4-6."""
+  "viral_score": 6.0,
+  "weakest_dimensions": ["specificity", "save_worthy_value"],
+  "improvement_suggestions": [
+    "Add a specific metric or company name to the main insight",
+    "Include a mini-framework or 3-step takeaway to make it bookmark-worthy"
+  ],
+  "reasoning": "One paragraph: honest assessment of why this post will or won't go viral"
+}}"""
 
         try:
             response = chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=MODEL_SCORER(),
-                options={"temperature": 0.2, "num_ctx": 4096},
+                options={"temperature": 0.3, "num_ctx": 8192},
             )
 
             scored = _parse_json_from_llm(response)
-            viral_score = float(scored.get("viral_score", 5.0))
-            viral_score = max(0.0, min(10.0, viral_score))
-
-            # Update reasoning in optimized post
-            score_reasoning = scored.get("reasoning", "")
             breakdown = scored.get("breakdown", {})
+            score_reasoning = scored.get("reasoning", "")
+            improvement_suggestions = list(scored.get("improvement_suggestions", []) or [])
+            weakest = list(scored.get("weakest_dimensions", []) or [])
+
+            # Calculate score from breakdown if dimensions are present (11 -> normalized /10)
+            if breakdown and len(breakdown) >= 5:
+                computed_score = sum(float(v) for v in breakdown.values())
+                if len(breakdown) >= 11:
+                    computed_score = (computed_score / len(breakdown)) * 10.0
+                computed_score = round(max(0.0, min(10.0, computed_score)), 1)
+                viral_score = computed_score
+            else:
+                viral_score = float(scored.get("viral_score", 5.0))
+                viral_score = max(0.0, min(10.0, viral_score))
+
+            if not isinstance(breakdown, dict):
+                breakdown = {}
+
+            realism_components = _compute_realism_components(verified_claims, hook_text)
+            realism_adjusted = realism_components.get("realism_score", 0.0)
+            breakdown["realism_score"] = realism_adjusted
+
+            # Additional realism penalties affect overall viral score
+            penalties = 0.0
+
+            if not verified_claims:
+                penalties += 0.7
+                weakest.append("realism_score")
+                improvement_suggestions.append("Add source-backed verified claims before making strong assertions.")
+
+            if verified_claims and all(bool(c.get("blog_only", False)) for c in verified_claims):
+                penalties += 0.2
+                weakest.append("realism_score")
+                improvement_suggestions.append("Add at least one independent non-blog source for key claims.")
+
+            funding_claims = [c for c in verified_claims if str(c.get("type", "")).lower() == "funding"]
+            if funding_claims and all(bool(c.get("wikipedia_only", False)) for c in funding_claims):
+                penalties += 0.2
+                weakest.append("realism_score")
+                improvement_suggestions.append("Use primary or financial-news sources for funding claims, not Wikipedia-only links.")
+
+            if _hyperbole_score(hook_text) >= 0.6:
+                penalties += 0.2
+                weakest.append("realism_score")
+                improvement_suggestions.append("Reduce absolutist/hyperbolic hook language to protect credibility.")
+
+            if any(bool(c.get("self_benchmark", False)) for c in verified_claims):
+                penalties += 0.2
+                weakest.append("realism_score")
+                improvement_suggestions.append("Treat self-reported benchmark claims as provisional unless independently validated.")
+
+            if realism_adjusted < 0.5:
+                penalties += 0.4
+                weakest.append("realism_score")
+                improvement_suggestions.append("Increase claim plausibility and independent confirmation for stronger realism.")
+
+            # Deterministic quality penalties to avoid inflated scores on short/generic posts
+            wc = _word_count(post_text)
+            if wc < 140:
+                penalties += 1.2
+                improvement_suggestions.append("Expand the post to at least 180 words with richer context and proof.")
+                weakest.append("structural_flow")
+            elif wc < 170:
+                penalties += 0.6
+                improvement_suggestions.append("Add one more insight block to reach 180-260 words.")
+
+            if not re.search(r"\d+%|\$\d|\b\d{2,}\b", post_text):
+                penalties += 0.6
+                improvement_suggestions.append("Add a concrete metric, number, or named example to increase specificity.")
+                weakest.append("specificity")
+
+            if _is_generic_cta(cta_text):
+                penalties += 0.4
+                improvement_suggestions.append("Replace generic CTA with either/or or fill-in-the-blank question.")
+                weakest.append("cta_effectiveness")
+
+            # Realism penalty: numbers present but weak verification coverage
+            if re.search(r"\d+%|\$\d|\b\d{2,}\b", post_text) and len(verified_claims) == 0:
+                penalties += 0.8
+                improvement_suggestions.append("Remove unsupported numbers or add source-backed verified claims.")
+                weakest.append("realism_score")
+            elif len(verified_claims) < 2:
+                penalties += 0.4
+                improvement_suggestions.append("Anchor key statements to at least 2 verified claims.")
+                weakest.append("realism_score")
+
+            if penalties > 0:
+                viral_score = max(0.0, round(viral_score - penalties, 1))
+                score_reasoning = (
+                    (score_reasoning + " ").strip()
+                    + f"Deterministic penalties applied: -{penalties:.1f} for length/specificity/CTA/realism guardrails."
+                ).strip()
+
+            # Deduplicate suggestions and weakest dimensions
+            if improvement_suggestions:
+                improvement_suggestions = list(dict.fromkeys([s for s in improvement_suggestions if s]))
+            if weakest:
+                weakest = list(dict.fromkeys([w for w in weakest if w]))
 
         except Exception as e:
             log_error("viral_scorer", f"Scoring failed: {e}")
-            viral_score = 5.0
-            score_reasoning = f"Scoring failed ({e}) — default score applied"
+            viral_score = 4.5  # Changed from 5.0 — slightly below average default
+            score_reasoning = f"Scoring failed ({e}) — conservative default applied"
             breakdown = {}
+            improvement_suggestions = []
+            weakest = []
+
+        # =============================
+        # SELF-CORRECTION: If score < 6.0, feed improvements back to optimizer for a second pass
+        # =============================
+        optimized = state.get("optimized_post", {}).copy()
+
+        if viral_score < 6.0 and improvement_suggestions and not _is_low_cost_mode():
+            log_node("viral_scorer", "SELF-CORRECTION", f"Score {viral_score}/10 — running improvement pass")
+
+            correction_prompt = f"""{MASTER_PROMPT}
+
+### TASK: IMPROVE this LinkedIn post based on scorer feedback
+
+The viral scorer rated this post {viral_score}/10. Here's what needs fixing:
+
+WEAKEST AREAS: {', '.join(weakest)}
+
+SPECIFIC FIXES NEEDED:
+{chr(10).join(f'- {s}' for s in improvement_suggestions)}
+
+### CURRENT POST:
+{optimized.get('post', '')}
+
+### CTA:
+{optimized.get('cta', '')}
+
+### RULES:
+- Apply ONLY the suggested improvements
+- Keep the same hook, flow, and voice
+- Do NOT rewrite from scratch — make surgical edits
+- Output the improved version
+
+### OUTPUT (valid JSON only):
+{{
+  "post": "improved full post with \\n line breaks",
+  "cta": "improved CTA if needed",
+  "changes_made": ["list of specific changes you made"]
+}}"""
+
+            try:
+                correction_response = chat(
+                    messages=[{"role": "user", "content": correction_prompt}],
+                    model=MODEL_OPTIMIZER(),
+                    options={"temperature": 0.4, "num_ctx": 8192},
+                )
+
+                correction = _parse_json_from_llm(correction_response)
+                if correction.get("post"):
+                    optimized["post"] = correction["post"]
+                    if correction.get("cta"):
+                        optimized["cta"] = correction["cta"]
+                    changes = correction.get("changes_made", [])
+                    score_reasoning += f"\n\nSelf-correction applied: {', '.join(changes)}"
+                    # Bump score slightly after corrections (conservative +0.5-1.0)
+                    viral_score = min(10.0, viral_score + 0.7)
+                    log_node("viral_scorer", "SELF-CORRECTION", f"Corrections applied. Adjusted score: {viral_score}/10")
+
+            except Exception as e:
+                log_error("viral_scorer", f"Self-correction failed: {e}")
 
         # Merge score into optimized post
-        optimized = state.get("optimized_post", {}).copy()
         optimized["viral_score_prediction"] = viral_score
         if score_reasoning:
             optimized["reasoning"] = (
@@ -776,21 +2140,42 @@ BE HONEST. Not every post is a 9/10. Average LinkedIn posts score 4-6."""
         if breakdown:
             optimized["score_breakdown"] = breakdown
 
+        score_feedback = {
+            "weakest_dimensions": weakest,
+            "improvement_suggestions": improvement_suggestions,
+            "latest_score": viral_score,
+            "realism_score": _safe_float((breakdown or {}).get("realism_score", 0.0), 0.0),
+        }
+
         log_state_update("viral_scorer", "viral_score", f"{viral_score}/10")
-        return {"optimized_post": optimized, "viral_score": viral_score}
+        return {
+            "optimized_post": optimized,
+            "viral_score": viral_score,
+            "realism_score": _safe_float((breakdown or {}).get("realism_score", 0.0), 0.0),
+            "score_feedback": score_feedback,
+        }
 
 
 # ==========================================
-# NODE 9: STORE POST IN PGVECTOR
+# NODE 9: STORE POST IN PGVECTOR (QUALITY-GATED)
 # ==========================================
 def store_post_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Embed and store the final post in the linkedin_posts table."""
+    """
+    Embed and store the final post in the linkedin_posts table.
+    
+    Quality rules:
+    - Only store the embedding if viral_score >= MIN_STORE_SCORE (5.0)
+    - Posts below threshold are saved without embedding (won't pollute retrieval)
+    - This prevents low-quality posts from being retrieved as "style examples" later
+    """
     with NodeTimer("store_post"):
         optimized_post = state.get("optimized_post", {})
         topic = state.get("topic", "")
         tone = state.get("tone", "professional")
         audience = state.get("audience", "tech professionals")
         viral_score = state.get("viral_score", 0.0)
+        realism_score = state.get("realism_score", 0.0)
+        angle_package = state.get("angle_package", {})
 
         post_content = optimized_post.get("post", "")
         hook = optimized_post.get("hook", "")
@@ -801,10 +2186,15 @@ def store_post_node(state: Dict[str, Any]) -> Dict[str, Any]:
         post_id = None
 
         try:
-            # Generate embedding for the post
-            embedding = embed_text(post_content)
+            # QUALITY GATE: Only generate and store embedding for good posts
+            embedding = None
+            if viral_score >= MIN_STORE_SCORE:
+                embedding = embed_text(post_content)
+                log_node("store_post", "QUALITY GATE", f"Score {viral_score} >= {MIN_STORE_SCORE} — embedding stored for future retrieval")
+            else:
+                log_node("store_post", "QUALITY GATE", f"Score {viral_score} < {MIN_STORE_SCORE} — saved WITHOUT embedding (won't pollute retrieval)")
 
-            # Insert into database
+            # Insert into database (with or without embedding)
             post_id = insert_post(
                 content=post_content,
                 hook=hook,
@@ -817,7 +2207,21 @@ def store_post_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 topic=topic,
                 reasoning=reasoning,
                 status="draft",
+                score_breakdown=optimized_post.get("score_breakdown", {}),
+                realism_score=realism_score,
             )
+
+            if post_id and angle_package:
+                insert_angle_result(
+                    post_id=post_id,
+                    topic=topic,
+                    angle_type=angle_package.get("angle_type", ""),
+                    best_angle=angle_package.get("best_angle", ""),
+                    risk_level=angle_package.get("risk_level", "med"),
+                    viral_score=viral_score,
+                    realism_score=realism_score,
+                    supporting_facts=angle_package.get("supporting_facts", []),
+                )
         except Exception as e:
             log_error("store_post", f"Storage failed: {e}")
 
@@ -835,6 +2239,7 @@ def store_post_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "topic": topic,
             "status": "draft",
             "score_breakdown": optimized_post.get("score_breakdown", {}),
+            "realism_score": realism_score,
         }
 
         if not post_id:
@@ -931,6 +2336,20 @@ def linkedin_publish_node(state: Dict[str, Any]) -> Dict[str, Any]:
             publish_url = result.get("url", "")
             if post_id:
                 update_post_status(post_id, "published", publish_url)
+
+                # Best-effort engagement snapshot for learning loop
+                engagement = fetch_post_engagement(post_url=publish_url)
+                if "error" not in engagement:
+                    insert_post_engagement(
+                        post_id=post_id,
+                        publish_url=publish_url,
+                        linkedin_post_urn=engagement.get("post_urn", ""),
+                        impressions=engagement.get("impressions", 0),
+                        reactions=engagement.get("reactions", 0),
+                        comments=engagement.get("comments", 0),
+                        reposts=engagement.get("reposts", 0),
+                        payload=engagement.get("payload", {}),
+                    )
 
             log_agent_end(post_id, state.get("viral_score", 0))
             log_state_update("linkedin_publish", "publish_url", publish_url)
