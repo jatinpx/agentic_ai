@@ -26,3 +26,5 @@ fpdf2
 
 # LinkedIn API (HTTP client)
 httpx
+# Configuration
+pyyaml

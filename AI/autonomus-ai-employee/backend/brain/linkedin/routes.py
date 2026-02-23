@@ -2,22 +2,25 @@
 LinkedIn Content Agent — FastAPI Routes.
 
 Endpoints:
-    POST /linkedin/generate        — Generate a LinkedIn post (stops at approval)
-    POST /linkedin/approve         — Approve/regenerate/reject a post
-    POST /linkedin/abort           — Abort a running pipeline
-    GET  /linkedin/posts           — List all generated posts
-    GET  /linkedin/posts/{post_id} — Get a specific post
-    GET  /linkedin/auth/url        — Get LinkedIn OAuth2 authorization URL
-    GET  /linkedin/auth/callback   — Handle OAuth2 callback
-    GET  /linkedin/auth/status     — Check if LinkedIn is authenticated
-    WS   /linkedin/ws/{thread_id}  — WebSocket for real-time pipeline updates
+    GET  /linkedin/config           — Get configuration options for UI
+    GET  /linkedin/profile-summary  — Get current user profile summary
+    POST /linkedin/generate-with-config — Generate post with full UI config
+    POST /linkedin/generate         — Generate a LinkedIn post (stops at approval)
+    POST /linkedin/approve          — Approve/regenerate/reject a post
+    POST /linkedin/abort            — Abort a running pipeline
+    GET  /linkedin/posts            — List all generated posts
+    GET  /linkedin/posts/{post_id}  — Get a specific post
+    GET  /linkedin/auth/url         — Get LinkedIn OAuth2 authorization URL
+    GET  /linkedin/auth/callback    — Handle OAuth2 callback
+    GET  /linkedin/auth/status      — Check if LinkedIn is authenticated
+    WS   /linkedin/ws/{thread_id}   — WebSocket for real-time pipeline updates
 """
 
 import uuid
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, BackgroundTasks
-from typing import Optional
+from typing import Optional, Union
 
-from brain.linkedin.models import PostInput, LinkedInApprovalRequest, LinkedInAuthCallback
+from brain.linkedin.models import PostInput, LinkedInApprovalRequest, LinkedInAuthCallback, PostGenerationRequest
 from brain.linkedin.graph import build_linkedin_agent
 from brain.logger import set_thread_id, clear_thread_id
 from brain.linkedin.cancellation import request_abort, clear_abort, is_abort_requested, PipelineAborted
@@ -31,6 +34,11 @@ from services.linkedin_api import (
     get_access_token,
     validate_oauth_state,
     get_configured_author_target,
+)
+from services.config_service import (
+    get_configuration_options,
+    merge_request_with_profile,
+    get_profile_summary,
 )
 
 # ==========================================
@@ -108,6 +116,46 @@ def run_linkedin_pipeline(thread_id: str, initial_state: dict):
 # POST GENERATION
 # ==========================================
 
+@router.get("/config")
+async def get_config():
+    """
+    Get all configuration options for UI form generation.
+    
+    Returns:
+        Configuration schema with:
+        - All available options for tone, format, audience, goal, cta_style, storytelling_frequency
+        - Current defaults from user profile
+        - Field descriptions and validation rules
+        - User profile summary
+    
+    Usage:
+        1. Call this endpoint to populate UI dropdowns
+        2. Build PostGenerationRequest with selected values
+        3. POST to /generate with the request
+    """
+    try:
+        config = get_configuration_options()
+        return config
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load configuration: {str(e)}")
+
+
+@router.get("/profile-summary")
+async def profile_summary():
+    """
+    Get a summary of the current user profile.
+    
+    Returns:
+        User's identity, industries, tech stack, writing preferences, and career focus.
+        This is displayed in the UI to show what profile defaults are being used.
+    """
+    try:
+        summary = get_profile_summary()
+        return summary
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load profile: {str(e)}")
+
+
 def validate_topic_quality(topic: str) -> tuple[bool, str]:
     """Validate topic quality before starting pipeline. Returns (is_valid, error_message)."""
     import re
@@ -138,27 +186,51 @@ def validate_topic_quality(topic: str) -> tuple[bool, str]:
 
 
 @router.post("/generate")
-async def generate_post(req: PostInput, background_tasks: BackgroundTasks):
+async def generate_post(req: Union[PostGenerationRequest, PostInput], background_tasks: BackgroundTasks):
     """
     Start the LinkedIn post generation pipeline in the background.
     Returns thread_id immediately - connect to WebSocket for live updates.
     Pipeline runs all nodes up to human_approval, then stops for approval.
     
+    Accepts either:
+    - PostGenerationRequest: Optional override fields that merge with user profile defaults
+    - PostInput: Full configuration (legacy format, backwards compatible)
+    
     Usage:
-        1. POST /generate → get thread_id
+        1. POST /generate with config → get thread_id
         2. Open WebSocket at /ws/{thread_id}
         3. Receive live status as pipeline runs
         4. POST /approve when ready
     """
+    # Convert request to PostGenerationRequest if it's PostInput
+    if isinstance(req, PostInput):
+        # Legacy PostInput - convert to PostGenerationRequest for uniform handling
+        gen_request = PostGenerationRequest(
+            topic=req.topic,
+            tone=req.tone,
+            format=req.format,
+            audience=req.audience,
+            goal=req.goal,
+            include_emojis=req.include_emojis,
+            use_technical_jargon=req.use_technical_jargon,
+            cta_style=req.cta_style,
+            storytelling_frequency=req.storytelling_frequency,
+        )
+    else:
+        gen_request = req
+    
+    # Merge request overrides with profile defaults
+    resolved_config = merge_request_with_profile(gen_request)
+    
     # Validate topic quality BEFORE starting pipeline
-    is_valid, error_message = validate_topic_quality(req.topic)
+    is_valid, error_message = validate_topic_quality(resolved_config.topic)
     if not is_valid:
         raise HTTPException(status_code=400, detail=error_message)
     
     thread_id = str(uuid.uuid4())
     
     initial_state = {
-        "user_input": req.model_dump(),
+        "user_input": resolved_config.model_dump(),
         "topic": "",
         "tone": "",
         "audience": "",

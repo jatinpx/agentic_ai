@@ -1,5 +1,22 @@
 @import "tailwindcss";
 
+.material-symbols-outlined {
+  font-family: "Material Symbols Outlined";
+  font-weight: normal;
+  font-style: normal;
+  font-size: 20px;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  font-feature-settings: "liga";
+  -webkit-font-feature-settings: "liga";
+  -webkit-font-smoothing: antialiased;
+}
+
 :root {
   --background: #f6f7ff;
   --foreground: #101322;
@@ -46,6 +63,44 @@ html[data-theme="dark"] {
   --header-bg: rgba(12, 15, 28, 0.65);
 }
 
+html[data-theme="sand"] {
+  --background: #f6efe2;
+  --foreground: #2e2a24;
+  --muted: #716659;
+  --accent: #c58d4e;
+  --accent-2: #c0664a;
+  --accent-3: #7eab8d;
+  --glass-bg: rgba(255, 250, 242, 0.72);
+  --glass-border: rgba(112, 90, 64, 0.2);
+  --glass-shadow: 0 20px 55px rgba(98, 73, 41, 0.2);
+  --glass-highlight: rgba(255, 255, 255, 0.45);
+  --ring: rgba(197, 141, 78, 0.45);
+  --panel: rgba(250, 241, 229, 0.72);
+  --grid: rgba(255, 255, 255, 0.55);
+  --surface: rgba(255, 247, 236, 0.9);
+  --surface-strong: rgba(255, 250, 243, 0.95);
+  --header-bg: rgba(252, 244, 233, 0.82);
+}
+
+html[data-theme="forest"] {
+  --background: #eef5f0;
+  --foreground: #13291f;
+  --muted: #547166;
+  --accent: #2f8f68;
+  --accent-2: #5ea57f;
+  --accent-3: #79c8a8;
+  --glass-bg: rgba(244, 251, 247, 0.72);
+  --glass-border: rgba(24, 77, 53, 0.2);
+  --glass-shadow: 0 20px 55px rgba(19, 58, 41, 0.18);
+  --glass-highlight: rgba(255, 255, 255, 0.42);
+  --ring: rgba(47, 143, 104, 0.45);
+  --panel: rgba(236, 247, 241, 0.74);
+  --grid: rgba(255, 255, 255, 0.58);
+  --surface: rgba(245, 251, 247, 0.9);
+  --surface-strong: rgba(250, 255, 252, 0.96);
+  --header-bg: rgba(238, 247, 242, 0.84);
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
@@ -54,20 +109,39 @@ body {
   letter-spacing: -0.01em;
 }
 
-.app-shell {
+body {
   min-height: 100vh;
   background: radial-gradient(circle at 10% 20%, rgba(255, 183, 224, 0.25), transparent 45%),
     radial-gradient(circle at 80% 10%, rgba(123, 231, 210, 0.25), transparent 40%),
     radial-gradient(circle at 50% 80%, rgba(107, 140, 255, 0.2), transparent 45%),
     linear-gradient(180deg, rgba(255, 255, 255, 0.8) 0%, rgba(246, 247, 255, 0.6) 100%);
-  padding: 2.5rem 1.5rem 4rem;
 }
 
-html[data-theme="dark"] .app-shell {
+html[data-theme="dark"] body {
   background: radial-gradient(circle at 15% 20%, rgba(138, 163, 255, 0.2), transparent 50%),
     radial-gradient(circle at 80% 15%, rgba(103, 224, 203, 0.2), transparent 45%),
     radial-gradient(circle at 40% 85%, rgba(255, 157, 200, 0.18), transparent 45%),
     linear-gradient(180deg, rgba(11, 13, 22, 0.95) 0%, rgba(15, 18, 32, 0.9) 100%);
+}
+
+html[data-theme="sand"] body {
+  background: radial-gradient(circle at 12% 18%, rgba(224, 180, 130, 0.26), transparent 42%),
+    radial-gradient(circle at 84% 12%, rgba(196, 125, 97, 0.2), transparent 40%),
+    radial-gradient(circle at 45% 84%, rgba(121, 171, 141, 0.2), transparent 45%),
+    linear-gradient(180deg, rgba(255, 250, 241, 0.92) 0%, rgba(246, 239, 226, 0.9) 100%);
+}
+
+html[data-theme="forest"] body {
+  background: radial-gradient(circle at 10% 20%, rgba(94, 165, 127, 0.24), transparent 45%),
+    radial-gradient(circle at 86% 14%, rgba(121, 200, 168, 0.2), transparent 42%),
+    radial-gradient(circle at 42% 86%, rgba(47, 143, 104, 0.18), transparent 46%),
+    linear-gradient(180deg, rgba(244, 251, 247, 0.93) 0%, rgba(234, 245, 239, 0.9) 100%);
+}
+
+main {
+  width: 100%;
+  padding-top: 0px;
+  padding-bottom: 4rem;
 }
 
 .glass-card {
@@ -78,6 +152,7 @@ html[data-theme="dark"] .app-shell {
   backdrop-filter: blur(18px);
   -webkit-backdrop-filter: blur(18px);
   position: relative;
+  transition: transform 0.28s ease, box-shadow 0.28s ease, border-color 0.24s ease;
 }
 
 .glass-card::after {
@@ -103,6 +178,84 @@ html[data-theme="dark"] .app-shell {
   box-shadow: var(--glass-shadow);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
+}
+
+.top-nav {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.9rem 1rem;
+  background: var(--surface-strong);
+  border-bottom: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+}
+
+.top-nav__brand {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.top-nav__brand strong {
+  letter-spacing: 0.01em;
+}
+
+.top-nav__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.hero-panel {
+  border-radius: 24px;
+  padding: 1.3rem 1.5rem;
+  border: 1px solid var(--glass-border);
+  background: var(--panel);
+  box-shadow: var(--glass-shadow);
+  margin-bottom: 0.4rem;
+}
+
+.theme-dropdown {
+  position: relative;
+}
+
+.theme-dropdown__menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  min-width: 180px;
+  border: 1px solid var(--glass-border);
+  background: var(--surface-strong);
+  border-radius: 12px;
+  box-shadow: 0 18px 36px rgba(0, 0, 0, 0.16);
+  padding: 0.35rem;
+  z-index: 30;
+}
+
+.theme-dropdown__item {
+  width: 100%;
+  text-align: left;
+  border-radius: 9px;
+  padding: 0.48rem 0.62rem;
+  color: var(--foreground);
+  font-size: 0.78rem;
+  transition: background 0.18s ease, transform 0.18s ease;
+}
+
+.theme-dropdown__item:hover {
+  background: var(--surface);
+  transform: translateX(1px);
+}
+
+.theme-dropdown__item--active {
+  background: var(--panel);
+  border: 1px solid var(--ring);
 }
 
 .display-text {
@@ -315,6 +468,7 @@ html[data-theme="dark"] .app-shell {
 .section-grid {
   display: grid;
   gap: 1.5rem;
+  animation: fadeSlideIn 0.36s ease;
 }
 
 .section-grid.two-column {
@@ -323,4 +477,15 @@ html[data-theme="dark"] .app-shell {
 
 .muted-text {
   color: var(--muted);
+}
+
+@keyframes fadeSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }

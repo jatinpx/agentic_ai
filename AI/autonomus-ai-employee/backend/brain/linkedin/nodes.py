@@ -27,6 +27,8 @@ from services.memory_picker import pick_memory_for_role
 from embeddings.embedder import embed_text
 from tools.tavily_web_search import tavily_search, tavily_search_structured
 from brain.linkedin.usage_tracker import track_llm_call, track_search_call, get_usage_tracker
+from brain.linkedin.format_presets import FORMAT_PRESETS, get_format_preset, get_format_prompt_section
+from utilities.profile_loader import load_user_profile
 from db.linkedin_repo import (
     insert_post,
     search_similar_posts,
@@ -134,7 +136,7 @@ MASTER_PROMPT = """You are a world-class LinkedIn ghostwriter used by top founde
 YOUR WRITING PRINCIPLES:
 1. PATTERN INTERRUPT: The first line must break the reader's scroll reflex. Use unexpected statements, bold claims, or counterintuitive openings.
 2. INFORMATION DENSITY: Every sentence must teach, provoke, or move the story forward. Zero filler.
-3. VOICE AUTHENTICITY: Write like a real person sharing hard-won experience — not a chatbot summarizing the internet. Use first-person. Be specific. Name real tools, numbers, timelines.
+3. VOICE AUTHENTICITY: Write with authoritative insight from the writer's real experience — not a chatbot summarizing the internet. Sound credible, specific, and grounded. Name real tools, numbers, and methodologies. Anonymize company-specific details (e.g., turn "At CompanyX" into "When teams", "For instance" examples).
 4. STRUCTURAL RHYTHM: Alternate between 1-line punches and 2-3 line explanations. Use whitespace aggressively. One idea per paragraph.
 5. EMOTIONAL ARC: Every post needs tension → insight → resolution. The reader should feel something shift in their understanding.
 6. ENGAGEMENT ENGINEERING: End with a genuine question that people WANT to answer — not a generic "What do you think?" but a specific dilemma or choice.
@@ -146,11 +148,15 @@ HARD RULES:
 - NEVER write paragraphs longer than 3 lines
 - NEVER use bullet points in the first half of the post — earn the reader's attention with narrative first
 - If the user says no emojis → absolute zero emojis, not even in hashtags
+- NEVER mention your company name or specific employer in success stories — frame as industry patterns or anonymized case studies
 - Keep total post length between 150-280 words (LinkedIn sweet spot for engagement)
 
 QUALITY BAR:
 - Would a VP of Engineering at a FAANG company share this? If not, rewrite.
-- Does every line pass the "so what?" test? If a line doesn't change the reader's action or belief, cut it."""
+- Does every line pass the "so what?" test? If a line doesn't change the reader's action or belief, cut it.
+- Is the authority earned through insight, not through name-dropping your company?
+- Could this resonate with leaders in this industry sector broadly, not just within one company?
+"""
 
 
 def _clean_think_tags(text: str) -> str:
@@ -658,7 +664,7 @@ Rules:
 # NODE 1: INPUT VALIDATION
 # ==========================================
 def input_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate and unpack user input into state fields."""
+    """Validate and unpack user input into state fields. Load user profile and resolve post format."""
     with NodeTimer("input_node"):
         user_input = state.get("user_input", {})
 
@@ -672,10 +678,27 @@ def input_node(state: Dict[str, Any]) -> Dict[str, Any]:
             log_error("input_node", f"Validation failed: {e}")
             return {"error": f"Invalid input: {e}"}
 
+        # Load user profile
+        try:
+            user_persona = load_user_profile()
+        except Exception as e:
+            log_error("input_node", f"Profile loading failed: {e}")
+            user_persona = {}
+
+        # Resolve post format: request override > profile default > "medium"
+        request_format = (validated.format or "").strip().lower()
+        if request_format and request_format in FORMAT_PRESETS:
+            post_format = request_format
+        else:
+            profile_format = user_persona.get("writing", {}).get("default_format", "medium")
+            post_format = profile_format if profile_format in FORMAT_PRESETS else "medium"
+
         log_agent_start(validated.topic)
-        log_state_update("input_node", "topic+tone+audience+goal", validated.topic)
+        log_state_update("input_node", "topic+tone+audience+goal+format", f"{validated.topic} ({post_format})")
 
         return {
+            "user_persona": user_persona,
+            "post_format": post_format,
             "topic": validated.topic,
             "tone": validated.tone,
             "audience": validated.audience,
@@ -806,21 +829,28 @@ def viral_posts_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # NODE 4: TREND DISCOVERY (RAW SIGNALS)
 # ==========================================
 def trend_discovery_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Collect raw trend signals from Tavily without LLM summarization."""
+    """Collect raw trend signals from Tavily without LLM summarization. Prioritize user's tech stack and industry."""
     with NodeTimer("trend_discovery"):
         topic = state.get("topic", "")
+        user_persona = state.get("user_persona", {})
         previous_confidence = _safe_float(state.get("research_confidence", 1.0), 1.0)
         retry_count = int(state.get("research_retry_count", 0) or 0)
         if previous_confidence < 0.6:
             retry_count += 1
         current_month = time.strftime("%B %Y")
+        
+        # Extract tech stack and industry from user persona for contextual search
+        tech_stack = user_persona.get("technical", {}).get("tech_stack", [])
+        industry = user_persona.get("identity", {}).get("industry", "")
+        tech_context = " ".join(tech_stack[:2]) if tech_stack else ""  # Use top 2 techs
+        industry_context = f"in {industry}" if industry else ""
 
         queries = [
-            f"{topic} funding announcement {current_month}",
-            f"{topic} benchmark results {current_month}",
-            f"{topic} controversy {current_month}",
-            f"{topic} product launch {current_month}",
-            f"{topic} real world use case {current_month}",
+            f"{topic} {tech_context} funding announcement {current_month}".strip(),
+            f"{topic} {tech_context} benchmark results {current_month}".strip(),
+            f"{topic} {industry_context} controversy {current_month}".strip(),
+            f"{topic} {tech_context} product launch {current_month}".strip(),
+            f"{topic} {industry_context} real world use case {current_month}".strip(),
         ]
 
         trend_candidates = []
@@ -1276,11 +1306,17 @@ def contradiction_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # NODE 7: ANGLE BUILDER
 # ==========================================
 def angle_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Build a high-authority content angle from verified facts."""
+    """Build a high-authority content angle from verified facts. Tailor to user's job role and industry."""
     with NodeTimer("angle_builder"):
         topic = state.get("topic", "")
         audience = state.get("audience", "tech professionals")
+        user_persona = state.get("user_persona", {})
         verified_claims = state.get("verified_claims", [])
+        
+        # Extract persona context for angle tailoring
+        job_role = user_persona.get("identity", {}).get("job_role", "")
+        industry = user_persona.get("identity", {}).get("industry", "")
+        years_exp = user_persona.get("identity", {}).get("years_experience", 0)
 
         if not verified_claims:
             fallback = {
@@ -1295,9 +1331,14 @@ def angle_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
             f"- {c.get('claim')} (truth={c.get('truth_score')}, source_quality={c.get('source_quality')}, recency={c.get('recency')})"
             for c in verified_claims[:8]
         ])
+        
+        # Build persona context for prompt
+        persona_ctx = f"""You are a {job_role} with {years_exp} years of experience in {industry}.""" if job_role else ""
 
         prompt = f"""You are an elite thought-leadership strategist.
-Build a strong, defensible LinkedIn angle.
+Build a strong, defensible LinkedIn angle grounded in industry insight, not company-specific branding.
+
+{persona_ctx}
 
 TOPIC: {topic}
 AUDIENCE: {audience}
@@ -1316,7 +1357,9 @@ Output JSON only:
 Rules:
 - Avoid absolutist language like "dead", "always", "never", "everyone", "nobody"
 - Prefer credible framing such as "took a serious hit", "is losing ground", "often", "many"
- - If confidence is mixed, reflect uncertainty without becoming weak
+- If confidence is mixed, reflect uncertainty without becoming weak
+- Frame insights as industry-wide patterns, not tied to a single company
+- Generalize operational success stories: use "When teams implement X" instead of "At CompanyY we did X"
 """
 
         angle_package = {}
@@ -1353,13 +1396,19 @@ Rules:
 # NODE 7.5: AUTHORITY POV BUILDER
 # ==========================================
 def pov_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Generate an insider POV to strengthen authority tone."""
+    """Generate an insider POV to strengthen authority tone. Tailor to user's job role and industry."""
     with NodeTimer("pov_builder"):
         topic = state.get("topic", "")
         angle_package = state.get("angle_package", {})
         risk_flags = state.get("risk_flags", [])
         verified_claims = state.get("verified_claims", [])
         controversy_score = _safe_float(state.get("controversy_score", 0.0), 0.0)
+        user_persona = state.get("user_persona", {})
+        
+        # Extract persona context
+        job_role = user_persona.get("identity", {}).get("job_role", "engineer")
+        industry = user_persona.get("identity", {}).get("industry", "tech")
+        organization = user_persona.get("identity", {}).get("organization", "")
 
         if _is_low_cost_mode():
             pov_package = {
@@ -1371,8 +1420,15 @@ def pov_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
         facts_blob = "\n".join([f"- {c.get('claim', '')}" for c in verified_claims[:6]]) or "None"
         angle_ctx = json.dumps(angle_package, ensure_ascii=False) if angle_package else "None"
+        
+        # Build role-specific framing
+        role_framing = f"You are a senior {job_role} working in {industry}."
+        org_context = f" (similar context to {organization})" if organization else ""
 
-        prompt = f"""You are a top AI engineer writing a private memo.
+        prompt = f"""
+You are synthesizing a memo of authoritative industry insight about {topic}.
+
+{role_framing}{org_context}
 
 TOPIC: {topic}
 ANGLE: {angle_ctx}
@@ -1381,12 +1437,12 @@ VERIFIED FACTS:
 RISK FLAGS: {", ".join(risk_flags) if risk_flags else "none"}
 CONTROVERSY SCORE: {controversy_score}
 
-Answer with authoritative, insider tone:
-- What would a top AI engineer privately think about this?
-- What are they not saying publicly?
-- What is the uncomfortable truth?
+Answer with authoritative insight from a senior {job_role} perspective in the {industry} sector:
+- What does the industry consensus get wrong about this?
+- What is the uncomfortable truth most leaders avoid saying publicly?
+- How do high-performing teams in {industry} actually handle this challenge?
 
-Return JSON only:
+Return JSON only - frame insights as industry patterns, not company-specific observations:
 {{
   "founder_pov": "...",
   "insider_framing": "...",
@@ -1656,7 +1712,7 @@ DO NOT give every hook a 7. Most hooks are 4-6. Only rate 8+ if it's genuinely e
 # NODE 6: POST WRITER (MAIN BRAIN)
 # ==========================================
 def post_writer_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Write the full LinkedIn post using all gathered context."""
+    """Write the full LinkedIn post using all gathered context. Tailor to user persona and post format."""
     with NodeTimer("post_writer"):
         topic = state.get("topic", "")
         tone = state.get("tone", "professional")
@@ -1672,6 +1728,8 @@ def post_writer_node(state: Dict[str, Any]) -> Dict[str, Any]:
         viral_examples = state.get("viral_examples", [])
         hooks = state.get("hooks", [])
         score_feedback = state.get("score_feedback", {})
+        user_persona = state.get("user_persona", {})
+        post_format = state.get("post_format", "medium")
 
         realism = _compute_realism_components(verified_claims, selected_hook)
         if realism.get("realism_score", 0.0) < 0.6:
@@ -1719,6 +1777,32 @@ def post_writer_node(state: Dict[str, Any]) -> Dict[str, Any]:
         ]) or "None"
         angle_ctx = json.dumps(angle_package, ensure_ascii=False) if angle_package else "None"
         pov_ctx = json.dumps(pov_package, ensure_ascii=False) if pov_package else "None"
+        
+        # Extract persona context for prompt
+        job_role = user_persona.get("identity", {}).get("job_role", "")
+        organization = user_persona.get("identity", {}).get("organization", "")
+        years_exp = user_persona.get("identity", {}).get("years_experience", 0)
+        industry = user_persona.get("identity", {}).get("industry", "")
+        tech_stack = user_persona.get("technical", {}).get("tech_stack", [])
+        expertise_level = user_persona.get("technical", {}).get("expertise_level", "intermediate")
+        use_jargon = user_persona.get("writing", {}).get("use_technical_jargon", False)
+        
+        # Build persona context block for prompt
+        persona_ctx = f"""AUTHOR CONTEXT:
+- Role: {job_role or 'Tech Professional'}
+- Industry/Sector: {industry or 'Technology'}
+- Experience: {years_exp} years
+- Tech Stack: {', '.join(tech_stack[:3]) if tech_stack else 'Not specified'}
+- Expertise Level: {expertise_level.title()}
+- Jargon Preference: {"Uses technical terminology" if use_jargon else "Prefers accessible explanations"}
+
+Write as if YOU are this person sharing from your authentic experience in this sector.
+Frame examples and lessons as industry-wide insights, not tied to your employer.
+Anonymize company-specific successes as general patterns or methodologies."""
+        
+        # Get format-specific instructions
+        format_instructions = get_format_prompt_section(post_format)
+        
         feedback_ctx = ""
         if score_feedback:
             weakest = ", ".join(score_feedback.get("weakest_dimensions", [])[:4])
@@ -1733,6 +1817,8 @@ def post_writer_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
         prompt = f"""{MASTER_PROMPT}
 
+{persona_ctx}
+
 ### TASK: Write a complete LinkedIn post
 
 TOPIC: {topic}
@@ -1740,6 +1826,9 @@ TONE: {tone}
 TARGET AUDIENCE: {audience}
 PRIMARY GOAL: {goal}
 {emoji_instruction}
+
+### FORMAT REQUIREMENTS:
+{format_instructions}
 
 ### SELECTED HOOK (start with this — you may refine it slightly):
 {selected_hook}
@@ -1767,25 +1856,32 @@ PRIMARY GOAL: {goal}
 
 {feedback_ctx}
 
-### POST STRUCTURE TO FOLLOW:
+### POST STRUCTURE TO FOLLOW (adapted for {post_format} format):
 1. HOOK (lines 1-2): The selected hook. Must work in LinkedIn preview (first ~210 chars visible before "...see more").
 2. TENSION (lines 3-6): Build the problem, story, or counterintuitive setup. Create a gap between what the reader believes and what's true.
-3. INSIGHT (lines 7-12): Deliver the core value. Be specific — use numbers, names, timelines, real examples. This is where you earn the save/bookmark.
-4. PROOF/STORY (lines 13-16): One concrete example, case study, or personal experience that validates the insight. "I did X → Y happened."
-5. CTA (last 2 lines): Ask a SPECIFIC question tied to the content. Not "What do you think?" but "Have you ever [specific scenario]? How did you handle it?"
-6. KNOWLEDGE + EMOTION: Include at least one concrete fact/metric/tool/company and at least one emotional sentence (frustration, fear, relief, conviction, excitement).
+3. INSIGHT (lines 7-12): Deliver the core value. Be specific — use numbers, tools, methodologies, timelines, real examples. This is where you earn the save/bookmark.
+4. PROOF/STORY (lines 13-16): One concrete example or case study that validates the insight. Frame as industry pattern: "When teams implement X → Y typically happens" or "Most major deployments fail because..." (NOT "I did X at CompanyY").
+5. CTA (last 2 lines): Ask a SPECIFIC question tied to the content. Not "What do you think?" but "Have you ever faced [specific scenario]? How did you handle it?"
+6. KNOWLEDGE + EMOTION: Include at least one concrete fact/metric/tool/methodology and at least one emotional sentence (frustration, fear, relief, conviction, excitement).
 7. TAKEAWAY: Include one practical mini-framework/list of exactly 3 short points in the second half of the post.
 
+### ANONYMIZATION RULES:
+- NEVER mention your company name, employer, or specific company examples
+- Transform company wins into industry patterns: "At CompanyX we cut latency 30%" → "Implementing prompt caching via FastAPI can slash latency by 30%"
+- Use generalizing language: "When teams...", "Most successful deployments...", "For instance..." instead of "I saw", "We did", "At my company"
+- Keep the authority grounded in methodologies and practices, not company-specific anecdotes
+
 ### FORMATTING RULES:
-- Target 180-260 words total (hard minimum 170, hard maximum 280)
+- Target {get_format_preset(post_format)["word_range"][0]}-{get_format_preset(post_format)["word_range"][1]} words total
 - Single blank line between every paragraph
 - Paragraphs: 1-3 sentences max
-- No bullet points in the first half
+- No bullet points in the first half (for short/medium formats)
 - Hashtags: exactly 2-3, placed at the very end after a blank line
 
 ### REALISM RULES:
 - Do not invent funding numbers, benchmark values, or named partnerships not present in VERIFIED FACTS
 - If evidence is weak, express uncertainty explicitly
+- Do not reference specific company names unless they appear in VERIFIED FACTS
 
 ### SELF-CHECK BEFORE RESPONDING:
 Before writing your JSON output, mentally verify:
@@ -1793,7 +1889,7 @@ Before writing your JSON output, mentally verify:
 □ Would you personally stop scrolling for this?
 □ Is there at least one specific number, name, or data point?
 □ Does the CTA ask something people will WANT to answer?
-□ Is it under 280 words?
+□ Is it under {get_format_preset(post_format)["word_range"][1]} words?
 
 ### OUTPUT FORMAT (valid JSON only):
 {{
@@ -1899,12 +1995,14 @@ Current draft:
 # NODE 7: ENGAGEMENT OPTIMIZER
 # ==========================================
 def engagement_optimizer_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Optimize the post for engagement: readability, CTA, spacing, punchlines."""
+    """Optimize the post for engagement: readability, CTA, spacing, punchlines. Apply format-specific refinements."""
     with NodeTimer("engagement_optimizer"):
         generated_post = state.get("generated_post", {})
         tone = state.get("tone", "professional")
         audience = state.get("audience", "tech professionals")
         include_emojis = state.get("include_emojis", False)
+        post_format = state.get("post_format", "medium")
+        user_persona = state.get("user_persona", {})
 
         original_post = generated_post.get("post", "")
         original_cta = generated_post.get("cta", "")
@@ -1919,6 +2017,20 @@ def engagement_optimizer_node(state: Dict[str, Any]) -> Dict[str, Any]:
             return {"optimized_post": optimized}
 
         emoji_instruction = "Add 1-2 relevant emojis per section if they add value." if include_emojis else "Remove ALL emojis if any exist."
+        
+        # Get format-specific guidance
+        fmt_preset = get_format_preset(post_format)
+        word_min, word_max = fmt_preset["word_range"]
+        format_guidance = f"""
+### FORMAT-SPECIFIC OPTIMIZATION ({post_format.upper()} format):
+- Target word range: {word_min}-{word_max} words
+- {fmt_preset["structure"][-2] if len(fmt_preset["structure"]) > 1 else "Keep paragraphs short"}
+- {"Expect lower mobile engagement due to length" if word_max > 350 else "Maximize mobile readability with short paragraphs"}
+"""
+        
+        # Extract persona context for CTA personalization
+        cta_style = user_persona.get("writing", {}).get("cta_style", "question")
+        
         scorer_feedback_block = ""
         if score_feedback:
             weakest = ", ".join(score_feedback.get("weakest_dimensions", [])[:4])
@@ -1936,6 +2048,8 @@ def engagement_optimizer_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 TONE: {tone}
 AUDIENCE: {audience}
+CTA STYLE PREFERENCE: {cta_style.title()}
+{format_guidance}
 
 ### CURRENT DRAFT:
 HOOK: {original_hook}
@@ -1953,7 +2067,7 @@ CTA: {original_cta}
 
 3. **SPECIFICITY INJECTION**: Replace vague claims with concrete ones.
    BAD: "I've seen many companies struggle with this"
-   GOOD: "3 of the 5 startups I advised last year failed because of this exact pattern"
+   GOOD: "Most major deployments in this space fail for a single reason: unmanaged dependencies"
 
 4. **RHYTHM CHECK**: Read it aloud mentally. Alternate between:
    - Short punch (3-7 words)
@@ -2340,14 +2454,22 @@ Score each dimension independently. Think step-by-step for each one.
                 improvement_suggestions.append("Increase claim plausibility and independent confirmation for stronger realism.")
 
             # Deterministic quality penalties to avoid inflated scores on short/generic posts
+            # Format-aware word count validation
             wc = _word_count(post_text)
-            if wc < 140:
+            post_format = state.get("post_format", "medium")
+            format_preset = get_format_preset(post_format)
+            min_wc, max_wc = format_preset["word_range"]
+            
+            if wc < min_wc:
+                deficit = min_wc - wc
                 penalties += 1.2
-                improvement_suggestions.append("Expand the post to at least 180 words with richer context and proof.")
+                improvement_suggestions.append(f"Expand the post to at least {min_wc} words (currently {wc}). Add richer context, examples, or proof.")
                 weakest.append("structural_flow")
-            elif wc < 170:
-                penalties += 0.6
-                improvement_suggestions.append("Add one more insight block to reach 180-260 words.")
+            elif wc > max_wc:
+                excess = wc - max_wc
+                penalties += 0.8
+                improvement_suggestions.append(f"Trim the post to {max_wc} words max (currently {wc}). Remove redundant explanations or secondary arguments.")
+                weakest.append("structural_flow")
 
             if not re.search(r"\d+%|\$\d|\b\d{2,}\b", post_text):
                 penalties += 0.6
@@ -2368,6 +2490,21 @@ Score each dimension independently. Think step-by-step for each one.
                 penalties += 0.4
                 improvement_suggestions.append("Anchor key statements to at least 2 verified claims.")
                 weakest.append("realism_score")
+            
+            # Persona authenticity scoring (new dimension for personalization)
+            user_persona = state.get("user_persona", {})
+            job_role = user_persona.get("identity", {}).get("job_role", "")
+            if job_role and job_role.lower() not in post_text.lower() and (job_role.lower() + "'s" not in post_text.lower()):
+                # Post should reflect author's perspective somewhat
+                if "we" in post_text.lower() or "i" in post_text.lower():
+                    # Good - has first-person or inclusive language showing authentic voice
+                    pass
+                else:
+                    # Missing personal perspective
+                    penalties += 0.25
+                    improvement_suggestions.append(f"Add personal perspective from a {job_role}'s viewpoint for authenticity.")
+
+
 
             if penalties > 0:
                 viral_score = max(0.0, round(viral_score - penalties, 1))

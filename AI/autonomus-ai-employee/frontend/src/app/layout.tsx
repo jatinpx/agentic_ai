@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono, Fraunces } from "next/font/google";
+import "@fontsource/material-symbols-outlined";
 import "./globals.css";
 import { ThemeProvider } from "./components/ThemeProvider";
 

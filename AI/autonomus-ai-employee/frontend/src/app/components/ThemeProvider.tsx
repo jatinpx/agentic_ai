@@ -2,7 +2,7 @@
 
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
 
-type ThemeMode = "light" | "dark" | "system";
+type ThemeMode = "light" | "dark" | "sand" | "forest" | "system";
 
 type ThemeContextValue = {
   theme: ThemeMode;

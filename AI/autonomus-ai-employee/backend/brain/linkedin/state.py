@@ -14,6 +14,10 @@ class LinkedInAgentState(TypedDict):
     goal: str
     include_emojis: bool
     auto_publish: bool
+    post_format: str          # "short" | "medium" | "long" | "article" (resolved from request or profile)
+
+    # --- User Persona ---
+    user_persona: dict        # Loaded from user_profile.yaml (identity, technical, writing, career)
 
     # --- Memory / Context ---
     style_examples: list      # Past user posts matching style (quality-gated)

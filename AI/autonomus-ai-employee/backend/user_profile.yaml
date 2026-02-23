@@ -1,0 +1,144 @@
+# LinkedIn User Persona Profile
+# This file defines your professional identity, technical expertise, and writing preferences.
+# The LinkedIn content agent uses this to personalize posts, tailor research to your tech stack,
+# and generate content that sounds authentically like you.
+
+# ==========================================
+# IDENTITY
+# ==========================================
+identity:
+  # Your name (used in POV framing, optional disclosure)
+  name: "Jatin Panghal"
+  
+  # Primary job role / title
+  # Examples: "Founder", "Staff Engineer", "ML Engineer", "Product Manager", "CTO", "Growth Lead"
+  job_role: "Software Developer Engineer"
+  
+  # Organization name (kept generic to avoid direct company mentions in posts)
+  organization: "AI-based SaaS company"
+  
+  # Industry / vertical you work in
+  # Examples: "SaaS", "AI/ML", "Fintech", "Healthcare Tech", "B2B Enterprise", "Data Infrastructure"
+  industry: "AI/ML,Frontend Development,Saas, B2B Enterprise"
+  
+  # Years of professional experience
+  # Used to calibrate expertise level in generated content
+  years_experience: 1.5
+
+
+# ==========================================
+# TECHNICAL EXPERTISE
+# ==========================================
+technical:
+  # Primary programming languages and frameworks you use
+  # Examples: ["Python", "TypeScript", "React", "Django", "FastAPI", "Kubernetes", "LLMs"]
+  tech_stack:
+    - "Python"
+    - "TypeScript"
+    - "LLMs & Transformers"
+    - "Kubernetes"
+    - "PostgreSQL"
+    - "React"
+    - "Next.js"
+    - "FastAPI"
+    - "AWS/GCP/Azure"
+  
+  # Areas of technical depth (e.g., specializations, domains)
+  # Examples: ["Distributed Systems", "ML Infrastructure", "API Design", "System Reliability"]
+  expertise_areas:
+    - "Distributed Systems"
+    - "microservices architecture"
+    - "agentic AI systems and workflows"
+    - "ML Infrastructure"
+    - "Agentic AI"
+    -  "Frontend Architecture and optimization"
+    - "LLM Optimization"
+    - "API Design"
+    - "System Reliability"
+    - "Backend Scalability"
+  
+  # Your level of technical expertise
+  # Options: "beginner" | "intermediate" | "expert"
+  # This controls depth, jargon usage, and who the content is pitched to
+  expertise_level: "intermediate"
+
+
+# ==========================================
+# WRITING PREFERENCES
+# ==========================================
+writing:
+  # Default tone for posts when not specified per-request
+  # Options: "professional" | "casual" | "contrarian" | "storytelling"
+  default_tone: "professional"
+  
+  # Default post format/length when not specified per-request
+  # Options: "short" | "medium" | "long" | "article"
+  # - short: 80-150 words, 1-2 paragraphs, punchy
+  # - medium: 150-280 words, 3-5 paragraphs, balanced (current LinkedIn default)
+  # - long: 280-400 words, 5-7 paragraphs, depth focused
+  # - article: 400-600 words, 8+ paragraphs, comprehensive/in-depth
+  default_format: "medium"
+  
+  # Use emojis in posts? (can still be overridden per-request)
+  emoji_preference: false
+  
+  # Your typical call-to-action style
+  # Options: "question" | "provocation" | "invitation" | "actionable"
+  # - question: "What's your take on this?"
+  # - provocation: "Unpopular opinion: ..."
+  # - invitation: "Let's discuss in comments"
+  # - actionable: "Here's how to do it: ..."
+  cta_style: "question"
+  
+  # Do you typically use jargon and technical terminology?
+  # true = deep technical language, false = accessible/simplified explanations
+  use_technical_jargon: true
+  
+  # How often do you use storytelling/narratives in your posts?
+  # Options: "low" | "medium" | "high"
+  # Influences hook type selection and post structure
+  storytelling_frequency: "medium"
+
+
+# ==========================================
+# CAREER & INTERESTS
+# ==========================================
+career:
+  # How interested are you in corporate/enterprise topics vs. startup/indie topics?
+  # Scale 0-10 (0 = fully indie/startup focused, 10 = fully enterprise focused)
+  corporate_interest: 6
+  
+  # Key areas of career focus (helps research filter to relevant trends)
+  # Examples: ["Leadership", "Founding", "ML Research", "DevOps", "Security", "Product Strategy"]
+  focus_areas:
+    - "AI Research"
+    - "uX/UI Design and Frontend Development"
+    - "System Architecture"
+    - "PRODUCT DESIGN"
+    - "ML Research"
+    - "devops"
+                                      
+
+
+# ==========================================
+# NOTES
+# ==========================================
+# 1. The agent respects these preferences but can still be overridden per-request
+#    (e.g., you can request "short" format even if default is "medium")
+#
+# 2. If a field is blank/missing, sensible defaults apply:
+#    - expertise_level defaults to "intermediate"
+#    - default_format defaults to "medium"
+#    - emoji_preference defaults to false
+#
+# 3. The tech_stack and industry filter research queries to prioritize
+#    relevant trends (e.g., if you list "LLMs", Tavily searches will
+#    emphasize recent LLM-specific news)
+#
+# 4. The job_role, organization, and years_experience are used in angle/POV
+#    generation to ensure posts sound authentically written by you
+#
+# 5. The expertise_level calibrates content depth:
+#    - "beginner": posts define technical terms, focus on accessibility
+#    - "intermediate": balanced between depth and clarity
+#    - "expert": assumes technical knowledge, uses precise terminology
