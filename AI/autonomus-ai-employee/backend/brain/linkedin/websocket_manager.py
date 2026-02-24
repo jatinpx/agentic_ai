@@ -103,6 +103,12 @@ class ConnectionManager:
 # Global connection manager instance
 ws_manager = ConnectionManager()
 
+
+def get_connection_manager() -> ConnectionManager:
+    """Get the global connection manager instance."""
+    return ws_manager
+
+
 # Store the main event loop for scheduling from background threads
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
 

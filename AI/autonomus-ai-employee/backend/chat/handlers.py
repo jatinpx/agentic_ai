@@ -2,9 +2,11 @@
 Chat handlers for user interaction state machine.
 
 Manages conversation flow: topic selection → post generation → approval → publishing.
+Integrates with observability service for distributed tracing and event logging.
 """
 
 import logging
+import asyncio
 from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime, timedelta
 import json
@@ -12,7 +14,48 @@ import json
 from chat.models import ChatState, UserAction, DailySuggestion, SuggestionTopic, UserProfile
 from chat.telegram_adapter import get_telegram_adapter
 
+# Optional observability integration (graceful fallback if service not available)
+try:
+    from services.observability_service import get_observability_manager
+    OBSERVABILITY_ENABLED = True
+except ImportError:
+    OBSERVABILITY_ENABLED = False
+    get_observability_manager = lambda: None
+
 logger = logging.getLogger(__name__)
+
+
+def _emit_telegram_event(
+    event_type: str,
+    user_id: Optional[str] = None,
+    action: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    error_message: Optional[str] = None,
+):
+    """
+    Emit a structured event to the observability service for Telegram handlers.
+    Gracefully handles case where observability is not available.
+    """
+    if not OBSERVABILITY_ENABLED:
+        return
+    
+    try:
+        obs = get_observability_manager()
+        if not obs:
+            return
+        
+        # Emit event for tracing
+        obs._emit_event({
+            "type": event_type,
+            "platform": "telegram",
+            "user_id": user_id,
+            "action": action,
+            "metadata": metadata,
+            "error_message": error_message,
+            "correlation_id": obs.get_correlation_id(),
+        })
+    except Exception:
+        pass  # Observability failures should not crash the handlers
 
 
 class ChatStateManager:
@@ -23,6 +66,16 @@ class ChatStateManager:
         self._states: Dict[str, ChatState] = {}
         self._user_profiles: Dict[str, UserProfile] = {}
         self._action_callbacks: Dict[str, Callable] = {}
+        self._user_locks: Dict[str, asyncio.Lock] = {}
+        self._user_locks_guard = asyncio.Lock()
+
+    async def _get_user_lock(self, user_id: str) -> asyncio.Lock:
+        async with self._user_locks_guard:
+            lock = self._user_locks.get(user_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._user_locks[user_id] = lock
+            return lock
 
     async def get_user_state(self, user_id: str) -> ChatState:
         """Get current state for user, create if doesn't exist."""
@@ -65,6 +118,24 @@ class ChatStateManager:
         Returns:
             Dict with response data and next state
         """
+        # Emit to observability
+        _emit_telegram_event(
+            event_type="callback_start",
+            user_id=user_id,
+            action=callback_data.split(":")[0] if ":" in callback_data else callback_data,
+        )
+        
+        user_lock = await self._get_user_lock(user_id)
+        async with user_lock:
+            return await self._handle_callback_query_locked(user_id, callback_data, context)
+
+    async def _handle_callback_query_locked(
+        self,
+        user_id: str,
+        callback_data: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Internal callback handler guarded by per-user lock."""
         context = context or {}
         adapter = get_telegram_adapter()
 
@@ -76,6 +147,14 @@ class ChatStateManager:
             params = ""
 
         logger.info(f"User {user_id} triggered action: {action}")
+
+        # Emit to observability
+        _emit_telegram_event(
+            event_type="callback_action",
+            user_id=user_id,
+            action=action,
+            metadata={"params": params} if params else None,
+        )
 
         state = await self.get_user_state(user_id)
 
@@ -333,6 +412,17 @@ class ChatStateManager:
         
         Could be: editing suggestions, confirming actions, custom input, etc.
         """
+        user_lock = await self._get_user_lock(user_id)
+        async with user_lock:
+            return await self._handle_text_message_locked(user_id, text, context)
+
+    async def _handle_text_message_locked(
+        self,
+        user_id: str,
+        text: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Internal text handler guarded by per-user lock."""
         context = context or {}
         state = await self.get_user_state(user_id)
 

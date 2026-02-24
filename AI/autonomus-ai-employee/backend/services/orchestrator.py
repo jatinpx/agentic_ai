@@ -43,6 +43,20 @@ class DailyPipeline:
         self._thread_test_mode: Dict[str, bool] = {}
         self._thread_test_post: Dict[str, str] = {}
 
+    def _start_background_task(self, coro, task_name: str) -> None:
+        """Create tracked background task and surface exceptions in logs."""
+        task = asyncio.create_task(coro)
+
+        def _on_done(done_task: asyncio.Task):
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                logger.warning("Background task cancelled: %s", task_name)
+            except Exception as exc:
+                logger.error("Background task failed (%s): %s", task_name, exc, exc_info=True)
+
+        task.add_done_callback(_on_done)
+
     async def run_daily_pipeline(self, test_mode: bool = False) -> Dict[str, Any]:
         """
         Execute the full daily pipeline.
@@ -230,14 +244,15 @@ class DailyPipeline:
             )
 
             # Launch pipeline in background (don't await — let it run async)
-            asyncio.ensure_future(
+            self._start_background_task(
                 self._run_pipeline_and_notify(
                     user_id,
                     topic,
                     telegram_chat_id,
                     workflow_test_mode,
                     post_config=post_config,
-                )
+                ),
+                task_name=f"pipeline_generation:{user_id}",
             )
 
             return {"success": True, "message": "Post generation started"}
@@ -318,8 +333,12 @@ class DailyPipeline:
         try:
             logger.info(f"🚀 Running LinkedIn pipeline thread_id={thread_id}")
             loop = asyncio.get_event_loop()
+            pipeline_timeout = int(os.getenv("LINKEDIN_PIPELINE_TIMEOUT_SEC", "240"))
             # run_linkedin_pipeline is synchronous — run in thread pool
-            await loop.run_in_executor(None, run_linkedin_pipeline, thread_id, initial_state)
+            await asyncio.wait_for(
+                loop.run_in_executor(None, run_linkedin_pipeline, thread_id, initial_state),
+                timeout=pipeline_timeout,
+            )
 
             # Get final state after pipeline pauses at human_approval
             config = {"configurable": {"thread_id": thread_id}}
@@ -346,13 +365,44 @@ class DailyPipeline:
                 f"📊 Viral: {viral_score:.1f}/10 | Realism: {realism_score:.1f}/10\n\n"
                 + post_text
             )
-            await self.telegram.send_post_for_approval(
+            approval_message_id = await self.telegram.send_post_for_approval(
                 user_id=telegram_chat_id,
                 post_content=preview,
                 post_id=thread_id,
                 chat_id=telegram_chat_id,
             )
-            logger.info(f"✅ Post sent for Telegram approval (thread_id={thread_id})")
+
+            if not approval_message_id:
+                logger.warning(
+                    "Post approval message failed, sending fallback text (thread_id=%s)",
+                    thread_id,
+                )
+                fallback_sent = await self.telegram.send_notification(
+                    user_id=telegram_chat_id,
+                    notification_type="warning",
+                    message=(
+                        "Post generated, but approval buttons failed to render. "
+                        "Please use /start to refresh bot session and retry.\n\n"
+                        f"Draft preview:\n{post_text[:900]}"
+                    ),
+                    chat_id=telegram_chat_id,
+                )
+                if not fallback_sent:
+                    logger.error("Fallback delivery also failed for thread_id=%s", thread_id)
+            else:
+                logger.info(f"✅ Post sent for Telegram approval (thread_id={thread_id})")
+
+        except asyncio.TimeoutError:
+            logger.error("Pipeline timeout for user %s (thread_id=%s)", user_id, thread_id)
+            try:
+                await self.telegram.send_notification(
+                    user_id=telegram_chat_id,
+                    notification_type="error",
+                    message="Post generation timed out. Please try again in a minute.",
+                    chat_id=telegram_chat_id,
+                )
+            except Exception:
+                pass
 
         except Exception as e:
             logger.error(f"Pipeline error for user {user_id}: {e}", exc_info=True)
@@ -481,6 +531,8 @@ class DailyPipeline:
                     message=success_msg,
                     chat_id=telegram_chat_id,
                 )
+                self._thread_test_post.pop(thread_id, None)
+                self._thread_test_mode.pop(thread_id, None)
                 return {"success": True, "action": action, "publish_url": publish_url}
 
             await self.telegram.send_notification(
@@ -489,6 +541,8 @@ class DailyPipeline:
                 message="🧪 Test mode: rejection captured successfully.",
                 chat_id=telegram_chat_id,
             )
+            self._thread_test_post.pop(thread_id, None)
+            self._thread_test_mode.pop(thread_id, None)
             return {"success": True, "action": action, "publish_url": ""}
 
         from brain.linkedin.routes import linkedin_graph

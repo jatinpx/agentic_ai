@@ -2,10 +2,12 @@
 Telegram adapter for messaging integration.
 
 Handles Telegram webhook events, message formatting, button callbacks.
+Integrates with observability service for distributed tracing.
 """
 
 import json
 import logging
+import asyncio
 from typing import Dict, Any, List, Optional, Tuple
 import hashlib
 import hmac
@@ -28,7 +30,48 @@ except ImportError as e:
 
 from .models import DailySuggestion, SuggestionTopic, ChatState, UserAction
 
+# Optional observability integration (graceful fallback if service not available)
+try:
+    from services.observability_service import get_observability_manager
+    OBSERVABILITY_ENABLED = True
+except ImportError:
+    OBSERVABILITY_ENABLED = False
+    get_observability_manager = lambda: None
+
 logger = logging.getLogger(__name__)
+
+
+def _emit_telegram_adapter_event(
+    event_type: str,
+    operation: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    error_message: Optional[str] = None,
+):
+    """
+    Emit a structured event to the observability service for Telegram adapter operations.
+    Gracefully handles case where observability is not available.
+    """
+    if not OBSERVABILITY_ENABLED:
+        return
+    
+    try:
+        obs = get_observability_manager()
+        if not obs:
+            return
+        
+        # Emit event for tracing
+        obs._emit_event({
+            "type": event_type,
+            "platform": "telegram",
+            "operation": operation,
+            "chat_id": chat_id,
+            "metadata": metadata,
+            "error_message": error_message,
+            "correlation_id": obs.get_correlation_id(),
+        })
+    except Exception:
+        pass  # Observability failures should not crash the adapter
 
 
 class TelegramAdapter:
@@ -39,6 +82,7 @@ class TelegramAdapter:
         self.bot = None
         self.webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "default_secret")
         self._bot_initialized = False
+        self._bot_init_lock = asyncio.Lock()
         
         self._init_bot()
 
@@ -60,14 +104,51 @@ class TelegramAdapter:
         """Ensure bot is initialized before use (idempotent)."""
         if not self.bot or self._bot_initialized:
             return
+
+        async with self._bot_init_lock:
+            if not self.bot or self._bot_initialized:
+                return
+
+            try:
+                await asyncio.wait_for(self.bot.initialize(), timeout=15)
+                self._bot_initialized = True
+                logger.info("Telegram bot initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize Telegram bot: {e}")
+                self.bot = None
+
+    async def _send_with_retry(self, send_callable, operation: str, retries: int = 2, timeout_seconds: int = 20):
+        """Run Telegram API call with timeout + retries for transient failures."""
+        last_error: Optional[Exception] = None
+
+        for attempt in range(retries + 1):
+            try:
+                return await asyncio.wait_for(send_callable(), timeout=timeout_seconds)
+            except Exception as exc:
+                last_error = exc
+                if attempt < retries:
+                    backoff = 0.6 * (attempt + 1)
+                    logger.warning(
+                        "Telegram %s failed (attempt %s/%s): %s",
+                        operation,
+                        attempt + 1,
+                        retries + 1,
+                        exc,
+                    )
+                    await asyncio.sleep(backoff)
+                    await self._ensure_bot_initialized()
+                    continue
+
+        logger.error("Telegram %s failed after retries: %s", operation, last_error)
         
-        try:
-            await self.bot.initialize()
-            self._bot_initialized = True
-            logger.info("Telegram bot initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize Telegram bot: {e}")
-            self.bot = None
+        # Emit error to observability
+        _emit_telegram_adapter_event(
+            event_type="telegram_error",
+            operation=operation,
+            error_message=str(last_error),
+        )
+        
+        return None
 
     def verify_webhook_signature(self, payload: bytes, signature: str) -> bool:
         """
@@ -111,6 +192,13 @@ class TelegramAdapter:
             return None
 
         chat_id = chat_id or user_id
+
+        # Emit to observability
+        _emit_telegram_adapter_event(
+            event_type="send_suggestions",
+            chat_id=chat_id,
+            metadata={"topic_count": len(topics) if topics else 0},
+        )
 
         try:
             # Format message text
@@ -158,6 +246,50 @@ class TelegramAdapter:
         
         if not self.bot:
             logger.error("Telegram bot not initialized")
+            return None
+
+        chat_id = chat_id or user_id
+
+        try:
+            # Format post preview
+            message_text = f"""
+<b>✍️ Post Preview</b>
+
+{post_content[:3500]}{"..." if len(post_content) > 3500 else ""}
+
+<i>Approve to publish to LinkedIn?</i>
+"""
+
+            # Approval buttons
+            buttons = [
+                [
+                    InlineKeyboardButton("✅ Approve & Publish", callback_data=f"approve_post:{post_id}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"reject_post:{post_id}"),
+                ],
+                [
+                    InlineKeyboardButton("✏️ Edit", callback_data=f"edit_post:{post_id}"),
+                ],
+            ]
+            reply_markup = InlineKeyboardMarkup(buttons)
+
+            message = await self._send_with_retry(
+                lambda: self.bot.send_message(
+                    chat_id=chat_id,
+                    text=message_text,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML",
+                ),
+                operation="send_post_for_approval",
+            )
+
+            if not message:
+                return None
+
+            logger.info(f"Sent post for approval to user {user_id}, message_id={message.message_id}")
+            return str(message.message_id)
+
+        except Exception as e:
+            logger.error(f"Error sending post to user {user_id}: {e}")
             return None
 
     async def send_post_config_options(
@@ -208,44 +340,6 @@ class TelegramAdapter:
             reply_markup=reply_markup,
         )
 
-        chat_id = chat_id or user_id
-
-        try:
-            # Format post preview
-            message_text = f"""
-<b>✍️ Post Preview</b>
-
-{post_content[:500]}{"..." if len(post_content) > 500 else ""}
-
-<i>Approve to publish to LinkedIn?</i>
-"""
-
-            # Approval buttons
-            buttons = [
-                [
-                    InlineKeyboardButton("✅ Approve & Publish", callback_data=f"approve_post:{post_id}"),
-                    InlineKeyboardButton("❌ Reject", callback_data=f"reject_post:{post_id}"),
-                ],
-                [
-                    InlineKeyboardButton("✏️ Edit", callback_data=f"edit_post:{post_id}"),
-                ],
-            ]
-            reply_markup = InlineKeyboardMarkup(buttons)
-
-            message = await self.bot.send_message(
-                chat_id=chat_id,
-                text=message_text,
-                reply_markup=reply_markup,
-                parse_mode="HTML",
-            )
-
-            logger.info(f"Sent post for approval to user {user_id}, message_id={message.message_id}")
-            return str(message.message_id)
-
-        except Exception as e:
-            logger.error(f"Error sending post to user {user_id}: {e}")
-            return None
-
     async def send_notification(
         self,
         user_id: str,
@@ -281,12 +375,15 @@ class TelegramAdapter:
         icon = icons.get(notification_type, "•")
 
         try:
-            await self.bot.send_message(
-                chat_id=chat_id,
-                text=f"{icon} {message}",
-                parse_mode="HTML",
+            sent = await self._send_with_retry(
+                lambda: self.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"{icon} {message}",
+                    parse_mode="HTML",
+                ),
+                operation="send_notification",
             )
-            return True
+            return bool(sent)
         except Exception as e:
             logger.error(f"Error sending notification to user {user_id}: {e}")
             return False
@@ -305,14 +402,18 @@ class TelegramAdapter:
             return False
 
         try:
-            await self.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=int(message_id),
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode="HTML",
+            edited = await self._send_with_retry(
+                lambda: self.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=int(message_id),
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode="HTML",
+                ),
+                operation="edit_message",
+                retries=1,
             )
-            return True
+            return bool(edited)
         except Exception as e:
             logger.error(f"Error editing message {message_id}: {e}")
             return False
@@ -325,8 +426,12 @@ class TelegramAdapter:
             return False
 
         try:
-            await self.bot.delete_message(chat_id=chat_id, message_id=int(message_id))
-            return True
+            deleted = await self._send_with_retry(
+                lambda: self.bot.delete_message(chat_id=chat_id, message_id=int(message_id)),
+                operation="delete_message",
+                retries=1,
+            )
+            return bool(deleted)
         except Exception as e:
             logger.error(f"Error deleting message {message_id}: {e}")
             return False

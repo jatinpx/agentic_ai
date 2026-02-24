@@ -19,6 +19,7 @@ from brain.graph import build_full_agent # Ensure your graph file has this funct
 from brain.logger import set_thread_id, clear_thread_id
 from brain.linkedin.routes import router as linkedin_router
 from brain.linkedin.automation_routes import router as automation_router
+from routes.trace_routes import router as trace_router
 
 app = FastAPI()
 
@@ -29,6 +30,8 @@ graph = build_full_agent()
 app.include_router(linkedin_router)
 # Include automation workflow routes
 app.include_router(automation_router)
+# Include observability/tracing routes
+app.include_router(trace_router)
 
 # ==========================================
 # LINKEDIN OAUTH2 CALLBACK (Handles redirect from LinkedIn)
@@ -81,6 +84,40 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     """Create LinkedIn database tables on app startup if they don't exist."""
+    
+    # Initialize observability service
+    try:
+        from services.observability_service import get_observability_manager
+        from db.event_log_store import get_event_log_store
+        from brain.linkedin.websocket_manager import get_connection_manager
+        import logging
+        
+        obs_manager = get_observability_manager()
+        event_log_store = get_event_log_store()
+        websocket_manager = get_connection_manager()
+        
+        # Register event store callback for persistent logging
+        obs_manager.set_event_store_callback(event_log_store.store_event)
+        
+        # Register WebSocket callback for real-time streaming
+        async def broadcast_span_event(event: dict):
+            """Broadcast span events to WebSocket clients."""
+            try:
+                # Broadcast to all connected clients under "trace_live" namespace
+                await websocket_manager.broadcast({
+                    "type": "trace_event",
+                    "data": event,
+                    "correlation_id": event.get("correlation_id"),
+                })
+            except Exception as e:
+                logging.getLogger(__name__).debug(f"Failed to broadcast span event: {e}")
+        
+        obs_manager.register_event_callback(broadcast_span_event)
+        
+        print("[Startup] Observability service initialized with event store + WebSocket callbacks")
+    except Exception as e:
+        print(f"Warning: Could not initialize observability service: {e}")
+    
     try:
         from db.linkedin_repo import create_linkedin_tables
         create_linkedin_tables()
@@ -92,16 +129,24 @@ async def startup_event():
     try:
         import psycopg2
         from db.migrations.automation_tables import upgrade as migrate_automation
+        from db.migrations.observability_tables import upgrade as migrate_observability
         
         connection_string = os.getenv(
             "DATABASE_URL",
             "postgresql://postgres:postgres@localhost:5432/ai_employee"
         )
         conn = psycopg2.connect(connection_string)
+        
+        # Run both migrations
         migrate_automation(conn)
         print("[Startup] Automation database tables initialized")
+        
+        migrate_observability(conn)
+        print("[Startup] Observability database tables initialized")
+        
+        conn.close()
     except Exception as e:
-        print(f"Warning: Could not initialize automation tables: {e}")
+        print(f"Warning: Could not initialize database tables: {e}")
     
     # Start the scheduler and schedule daily pipeline
     try:

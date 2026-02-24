@@ -14,7 +14,8 @@ import json
 import ast
 import time
 import math
-from typing import Dict, Any
+import asyncio
+from typing import Dict, Any, List
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -45,6 +46,7 @@ from brain.linkedin.logging_utils import (
     log_node, log_agent_start, log_agent_end,
     log_state_update, log_token_usage, log_error, NodeTimer,
 )
+from services.observability_service import instrument_function
 
 
 # ==========================================
@@ -387,8 +389,15 @@ def _is_wikipedia_url(url: str) -> bool:
 
 
 def _is_self_benchmark_claim(claim: str) -> bool:
+    """Determine if a claim is a self-reported benchmark or performance stat."""
     c = (claim or "").lower()
-    benchmark_markers = ["benchmark", "accuracy", "latency", "speed", "score", "bleu", "mmlu"]
+    
+    # Industry-standard benchmarks (exempt from automatic self-reported penalty if cited well)
+    industry_standards = ["mmlu", "gsm8k", "humaneval", "truthfulqa", "mbpp", "arc-challenge", "gpqa", "ifeval"]
+    if any(s in c for s in industry_standards):
+        return False
+        
+    benchmark_markers = ["benchmark", "accuracy", "latency", "speed", "score", "bleu"]
     self_markers = [
         "self-reported",
         "self validated",
@@ -596,6 +605,7 @@ def _validate_topic_quality(topic: str) -> tuple[bool, str]:
     return True, ""
 
 
+@instrument_function(event_type="node_execution", node_name="input_refinement", capture_args=False)
 def input_refinement_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Clean or rewrite user input into a strong research topic if needed."""
     with NodeTimer("input_refinement"):
@@ -686,6 +696,7 @@ Rules:
 # ==========================================
 # NODE 1: INPUT VALIDATION
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="input", capture_args=False)
 def input_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Validate and unpack user input into state fields. Load user profile and resolve post format."""
     with NodeTimer("input_node"):
@@ -736,6 +747,7 @@ def input_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ==========================================
 # NODE 2: STYLE MEMORY FETCH
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="style_memory_fetch", capture_args=False)
 def style_memory_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Fetch user's previous posts from pgvector to match writing style.
@@ -798,6 +810,7 @@ def style_memory_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ==========================================
 # NODE 3: VIRAL POSTS FETCH
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="viral_posts_fetch", capture_args=False)
 def viral_posts_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Fetch viral post templates and high-performing past posts.
@@ -851,7 +864,7 @@ def viral_posts_fetch_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ==========================================
 # NODE 4: TREND DISCOVERY (RAW SIGNALS)
 # ==========================================
-def trend_discovery_node(state: Dict[str, Any]) -> Dict[str, Any]:
+async def trend_discovery_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Collect raw trend signals from Tavily without LLM summarization. Prioritize user's tech stack and industry."""
     with NodeTimer("trend_discovery"):
         topic = state.get("topic", "")
@@ -876,11 +889,25 @@ def trend_discovery_node(state: Dict[str, Any]) -> Dict[str, Any]:
             f"{topic} {industry_context} real world use case {current_month}".strip(),
         ]
 
+        # Parallelize initial queries
+        results = await asyncio.gather(*[asyncio.to_thread(tavily_search_structured, query=q, max_results=4) for q in queries])
+        
+        # Search failure recovery: Broaden search if zero results returned
+        if not any(r.get("results", []) for r in results):
+            fallback_queries = [
+                f"{topic} latest news {current_month}",
+                f"{topic} industry trends",
+                f"major {topic} updates"
+            ]
+            fallback_results = await asyncio.gather(*[asyncio.to_thread(tavily_search_structured, query=q, max_results=6) for q in fallback_queries])
+            queries.extend(fallback_queries)
+            results.extend(fallback_results)
+            log_state_update("trend_discovery", "broadened_search", "Triggered due to zero initial results")
+
         trend_candidates = []
         seen_urls = set()
 
-        for query in queries:
-            result = tavily_search_structured(query=query, max_results=4)
+        for query, result in zip(queries, results):
             track_search_call("trend_discovery", query, len(result.get("results", [])))
             
             for item in result.get("results", []):
@@ -917,6 +944,7 @@ def trend_discovery_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ==========================================
 # NODE 5: CLAIM EXTRACTION
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="claim_extraction", capture_args=False)
 def claim_extraction_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Extract structured claims from raw trend candidates."""
     with NodeTimer("claim_extraction"):
@@ -990,8 +1018,8 @@ Rules:
 # ==========================================
 # NODE 6: FACT VERIFICATION
 # ==========================================
-def fact_verification_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Verify extracted claims and compute research confidence."""
+async def fact_verification_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify extracted claims using multi-source search (parallelized)."""
     with NodeTimer("fact_verification"):
         topic = state.get("topic", "")
         extracted_claims = state.get("extracted_claims", [])
@@ -1004,13 +1032,22 @@ def fact_verification_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "research_retry_count": int(state.get("research_retry_count", 0) or 0),
             }
 
-        for claim_obj in extracted_claims[:12]:
+        # Prepare all verification queries (up to 12)
+        claims_to_verify = extracted_claims[:12]
+        search_tasks = []
+        queries = []
+        for claim_obj in claims_to_verify:
             claim_text = (claim_obj.get("claim") or "").strip()
             if not claim_text:
                 continue
+            v_query = f"{claim_text} source news {topic}"
+            queries.append(v_query)
+            search_tasks.append(asyncio.to_thread(tavily_search_structured, query=v_query, max_results=4))
+        
+        # Parallelize all searches
+        search_results = await asyncio.gather(*search_tasks)
 
-            verification_query = f"{claim_text} source news {topic}"
-            verification = tavily_search_structured(query=verification_query, max_results=4)
+        for claim_obj, verification, verification_query in zip(claims_to_verify, search_results, queries):
             track_search_call("fact_verification", verification_query, len(verification.get("results", [])))
             
             source_count = int(verification.get("count", 0) or 0)
@@ -1091,6 +1128,7 @@ def fact_verification_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ==========================================
 # NODE 6.2: RESEARCH QUALITY ASSESSMENT
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="research_quality", capture_args=False)
 def research_quality_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Compute research realism score from verified claims (pre-hook)."""
     with NodeTimer("research_quality"):
@@ -1121,6 +1159,7 @@ def research_quality_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ==========================================
 # NODE 6.3: SOURCE-AWARE QUERY GENERATOR
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="source_query_generator", capture_args=False)
 def source_query_generator_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Generate targeted research queries based on weak evidence."""
     with NodeTimer("source_query_generator"):
@@ -1194,8 +1233,8 @@ Rules:
 # ==========================================
 # NODE 6.4: TARGETED RE-SEARCH
 # ==========================================
-def targeted_research_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Run targeted research queries and merge results into trend candidates."""
+async def targeted_research_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Run targeted research queries and merge results into trend candidates (parallelized)."""
     with NodeTimer("targeted_research"):
         topic = state.get("topic", "")
         queries = state.get("research_queries", [])
@@ -1204,11 +1243,13 @@ def targeted_research_node(state: Dict[str, Any]) -> Dict[str, Any]:
         if not queries:
             return {"trend_candidates": existing, "trends": state.get("trends", "")}
 
+        # Parallelize targeted queries
+        results = await asyncio.gather(*[asyncio.to_thread(tavily_search_structured, query=q, max_results=4) for q in queries[:12]])
+
         trend_candidates = list(existing)
         seen_urls = {c.get("source") for c in existing if c.get("source")}
 
-        for query in queries[:12]:
-            result = tavily_search_structured(query=query, max_results=4)
+        for query, result in zip(queries[:12], results):
             for item in result.get("results", [])[:4]:
                 url = (item.get("url") or "").strip()
                 title = (item.get("title") or "").strip()
@@ -1241,8 +1282,8 @@ def targeted_research_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ==========================================
 # NODE 6.5: CONTRADICTION ENGINE
 # ==========================================
-def contradiction_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Search for counter-claims and controversy signals to balance confirmation bias."""
+async def contradiction_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Search for counter-claims and controversy signals to balance confirmation bias (parallelized)."""
     with NodeTimer("contradiction"):
         topic = state.get("topic", "")
         verified_claims = state.get("verified_claims", [])
@@ -1257,47 +1298,57 @@ def contradiction_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "confidence_adjustment": 0.0,
             }
 
-        controversy_hits = 0
-        total_checks = 0
-        keyword_markers = ["criticism", "controversy", "debate", "backlash", "lawsuit", "regulator", "antitrust", "ethics", "bias", "safety", "recall"]
-
+        # Prepare all contradiction/criticism queries (up to 8 claims)
+        search_tasks = []
+        search_metadata = []
         for claim_obj in verified_claims[:8]:
             claim_text = (claim_obj.get("claim") or "").strip()
             if not claim_text:
                 continue
-
+            
             queries = [
                 f"{claim_text} criticism",
                 f"{topic} controversy",
                 f"{claim_text} debate",
             ]
+            for q in queries:
+                search_metadata.append({"claim_text": claim_text, "query": q})
+                search_tasks.append(asyncio.to_thread(tavily_search_structured, query=q, max_results=3))
+        
+        # Parallelize all contradiction searches
+        all_search_results = await asyncio.gather(*search_tasks)
 
-            for query in queries:
-                total_checks += 1
-                result = tavily_search_structured(query=query, max_results=3)
-                for item in result.get("results", [])[:3]:
-                    snippet = (item.get("content") or "").strip()
-                    title = (item.get("title") or "").strip()
-                    url = (item.get("url") or "").strip()
-                    if not snippet:
-                        continue
+        controversy_hits = 0
+        total_checks = len(all_search_results)
+        keyword_markers = ["criticism", "controversy", "debate", "backlash", "lawsuit", "regulator", "antitrust", "ethics", "bias", "safety", "recall"]
 
-                    text_blob = f"{title} {snippet}".lower()
-                    has_risk = any(marker in text_blob for marker in keyword_markers)
-                    if has_risk:
-                        controversy_hits += 1
-                        risk_flags.add("controversy")
+        for meta, result in zip(search_metadata, all_search_results):
+            claim_text = meta["claim_text"]
+            query = meta["query"]
+            
+            for item in result.get("results", [])[:3]:
+                snippet = (item.get("content") or "").strip()
+                title = (item.get("title") or "").strip()
+                url = (item.get("url") or "").strip()
+                if not snippet:
+                    continue
 
-                    counter_claims.append({
-                        "claim": claim_text,
-                        "query": query,
-                        "title": title,
-                        "source": url,
-                        "snippet": snippet[:320],
-                        "date": item.get("published_date", ""),
-                        "domain": _domain_from_url(url),
-                        "risk_signal": has_risk,
-                    })
+                text_blob = f"{title} {snippet}".lower()
+                has_risk = any(marker in text_blob for marker in keyword_markers)
+                if has_risk:
+                    controversy_hits += 1
+                    risk_flags.add("controversy")
+
+                counter_claims.append({
+                    "claim": claim_text,
+                    "query": query,
+                    "title": title,
+                    "source": url,
+                    "snippet": snippet[:320],
+                    "date": item.get("published_date", ""),
+                    "domain": _domain_from_url(url),
+                    "risk_signal": has_risk,
+                })
 
         controversy_score = _clamp(controversy_hits / max(total_checks, 1), 0.0, 1.0)
         if controversy_score >= 0.6:
@@ -1328,6 +1379,7 @@ def contradiction_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ==========================================
 # NODE 7: ANGLE BUILDER
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="angle_builder", capture_args=False)
 def angle_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Build a high-authority content angle from verified facts. Tailor to user's job role and industry."""
     with NodeTimer("angle_builder"):
@@ -1418,6 +1470,7 @@ Rules:
 # ==========================================
 # NODE 7.5: AUTHORITY POV BUILDER
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="pov_builder", capture_args=False)
 def pov_builder_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Generate an insider POV to strengthen authority tone. Tailor to user's job role and industry."""
     with NodeTimer("pov_builder"):
@@ -1502,6 +1555,7 @@ Return JSON only - frame insights as industry patterns, not company-specific obs
 # ==========================================
 # NODE 5: HOOK GENERATOR
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="hook_generator", capture_args=False)
 def hook_generator_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Generate 5 hook types and select the best one."""
     with NodeTimer("hook_generator"):
@@ -1734,8 +1788,9 @@ DO NOT give every hook a 7. Most hooks are 4-6. Only rate 8+ if it's genuinely e
 # ==========================================
 # NODE 6: POST WRITER (MAIN BRAIN)
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="post_writer", capture_args=False)
 def post_writer_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Write the full LinkedIn post using all gathered context. Tailor to user persona and post format."""
+    """Write the full LinkedIn post using all gathered context (grounded with counter-evidence)."""
     with NodeTimer("post_writer"):
         topic = state.get("topic", "")
         tone = state.get("tone", "professional")
@@ -1745,6 +1800,7 @@ def post_writer_node(state: Dict[str, Any]) -> Dict[str, Any]:
         selected_hook = state.get("selected_hook", "")
         trends = state.get("trends", "")
         verified_claims = state.get("verified_claims", [])
+        counter_claims = state.get("counter_claims", [])
         angle_package = state.get("angle_package", {})
         pov_package = state.get("pov_package", {})
         style_examples = state.get("style_examples", [])
@@ -1795,9 +1851,15 @@ def post_writer_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
         emoji_instruction = "Include relevant emojis where they add value." if include_emojis else "Do NOT use any emojis."
         claims_ctx = "\n".join([
-            f"- {c.get('claim', '')} (truth={c.get('truth_score', 0)}, source_quality={c.get('source_quality', 0)}, recency={c.get('recency', 0)})"
+            f"- {c.get('claim', '')} (truth={c.get('truth_score', 0)}, source_quality={c.get('source_quality', 0)})"
             for c in verified_claims[:8]
         ]) or "None"
+        
+        counter_ctx = "\n".join([
+            f"- {c.get('snippet', '')[:200]} (Potential trade-off/risk for claim: {c.get('claim', '')})"
+            for c in counter_claims[:3]
+        ]) or "No major contradictions found."
+
         angle_ctx = json.dumps(angle_package, ensure_ascii=False) if angle_package else "None"
         pov_ctx = json.dumps(pov_package, ensure_ascii=False) if pov_package else "None"
         
@@ -1861,6 +1923,9 @@ PRIMARY GOAL: {goal}
 
 ### VERIFIED FACTS (MUST anchor claims to these):
 {claims_ctx}
+
+### COUNTER-ARGUMENTS & RISKS (incorporate to increase realism/balance):
+{counter_ctx}
 
 ### STRATEGIC ANGLE (follow this thesis):
 {angle_ctx}
@@ -1999,6 +2064,20 @@ Current draft:
                         "reasoning": expanded.get("reasoning", generated_post.get("reasoning", "")),
                     })
 
+            # Deterministic Source Citations (Realism Upgrade)
+            if verified_claims:
+                top_sources = []
+                for c in verified_claims[:2]:
+                    urls = c.get("source_urls", [])
+                    if urls:
+                        top_sources.append(urls[0])
+                
+                if top_sources:
+                    sources_text = "\n\nSources:\n" + "\n".join([f"- {url}" for url in top_sources])
+                    # Only append if not already present and if post is long enough
+                    if "Sources:" not in generated_post.get("post", ""):
+                        generated_post["post"] = generated_post.get("post", "") + sources_text
+
         except Exception as e:
             log_error("post_writer", f"Post writing failed: {e}")
             generated_post = {
@@ -2017,6 +2096,7 @@ Current draft:
 # ==========================================
 # NODE 7: ENGAGEMENT OPTIMIZER
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="engagement_optimizer", capture_args=False)
 def engagement_optimizer_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Optimize the post for engagement: readability, CTA, spacing, punchlines. Apply format-specific refinements."""
     with NodeTimer("engagement_optimizer"):
@@ -2164,6 +2244,7 @@ CRITICAL: Keep the author's core message and voice. You are editing, not rewriti
 # ==========================================
 # NODE 8: VIRAL SCORER (10-DIMENSION RUBRIC)
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="viral_scorer", capture_args=False)
 def viral_scorer_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Independently score the post's viral potential using a 10-dimension rubric.
@@ -2451,18 +2532,18 @@ Score each dimension independently. Think step-by-step for each one.
                 improvement_suggestions.append("Add source-backed verified claims before making strong assertions.")
 
             if verified_claims and all(bool(c.get("blog_only", False)) for c in verified_claims):
-                penalties += 0.2
+                penalties += 0.1
                 weakest.append("realism_score")
                 improvement_suggestions.append("Add at least one independent non-blog source for key claims.")
 
             funding_claims = [c for c in verified_claims if str(c.get("type", "")).lower() == "funding"]
             if funding_claims and all(bool(c.get("wikipedia_only", False)) for c in funding_claims):
-                penalties += 0.2
+                penalties += 0.1
                 weakest.append("realism_score")
                 improvement_suggestions.append("Use primary or financial-news sources for funding claims, not Wikipedia-only links.")
 
             if _hyperbole_score(hook_text) >= 0.6:
-                penalties += 0.2
+                penalties += 0.1
                 weakest.append("realism_score")
                 improvement_suggestions.append("Reduce absolutist/hyperbolic hook language to protect credibility.")
 
@@ -2470,9 +2551,15 @@ Score each dimension independently. Think step-by-step for each one.
                 penalties += 0.2
                 weakest.append("realism_score")
                 improvement_suggestions.append("Treat self-reported benchmark claims as provisional unless independently validated.")
+            
+            # < 2 independent sources across all key claims
+            if verified_claims and all(int(c.get("independent_sources", 0) or 0) < 2 for c in verified_claims):
+                penalties += 0.2
+                weakest.append("realism_score")
+                improvement_suggestions.append("Find a second independent source to confirm the primary claims.")
 
             if realism_adjusted < 0.5:
-                penalties += 0.4
+                penalties += 0.3
                 weakest.append("realism_score")
                 improvement_suggestions.append("Increase claim plausibility and independent confirmation for stronger realism.")
 
@@ -2637,6 +2724,7 @@ SPECIFIC FIXES NEEDED:
 # ==========================================
 # NODE 9: STORE POST IN PGVECTOR (QUALITY-GATED)
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="store_post", capture_args=False)
 def store_post_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Embed and store the final post in the linkedin_posts table.
@@ -2745,6 +2833,7 @@ def store_post_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ==========================================
 # NODE 10: HUMAN APPROVAL
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="human_approval", capture_args=False)
 def human_approval_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Placeholder node for human-in-the-loop approval.
@@ -2763,6 +2852,7 @@ def human_approval_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ==========================================
 # NODE 11: LINKEDIN PUBLISH
 # ==========================================
+@instrument_function(event_type="node_execution", node_name="linkedin_publish", capture_args=False)
 def linkedin_publish_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Publish the approved post to LinkedIn."""
     with NodeTimer("linkedin_publish"):

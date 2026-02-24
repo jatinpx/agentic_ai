@@ -36,47 +36,43 @@ class AutomationDBService:
     ) -> Dict[str, Any]:
         """Get existing user or create new one."""
         try:
-            conn = self._get_connection()
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            if not telegram_user_id and not whatsapp_phone:
+                raise ValueError("Either telegram_user_id or whatsapp_phone is required")
 
-            # Try to get existing
-            if telegram_user_id:
-                cursor.execute(
-                    "SELECT * FROM users WHERE telegram_user_id = %s",
-                    (telegram_user_id,),
-                )
-            elif whatsapp_phone:
-                cursor.execute(
-                    "SELECT * FROM users WHERE whatsapp_phone = %s",
-                    (whatsapp_phone,),
-                )
-            else:
-                user = None
+            with self._get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                    user_id = str(uuid.uuid4())
 
-            user = cursor.fetchone()
+                    if telegram_user_id:
+                        cursor.execute(
+                            """
+                            INSERT INTO users (id, telegram_user_id, telegram_username, whatsapp_phone)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (telegram_user_id)
+                            DO UPDATE SET
+                                telegram_username = COALESCE(EXCLUDED.telegram_username, users.telegram_username),
+                                updated_at = NOW()
+                            RETURNING *
+                            """,
+                            (user_id, telegram_user_id, telegram_username, whatsapp_phone),
+                        )
+                    else:
+                        cursor.execute(
+                            """
+                            INSERT INTO users (id, telegram_user_id, telegram_username, whatsapp_phone)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (whatsapp_phone)
+                            DO UPDATE SET updated_at = NOW()
+                            RETURNING *
+                            """,
+                            (user_id, telegram_user_id, telegram_username, whatsapp_phone),
+                        )
 
-            if user:
-                cursor.close()
-                conn.close()
-                return dict(user)
+                    user = cursor.fetchone()
 
-            # Create new user
-            user_id = str(uuid.uuid4())
-            cursor.execute(
-                """
-                INSERT INTO users (id, telegram_user_id, telegram_username, whatsapp_phone)
-                VALUES (%s, %s, %s, %s)
-                RETURNING *
-                """,
-                (user_id, telegram_user_id, telegram_username, whatsapp_phone),
-            )
+            if not user:
+                raise RuntimeError("Failed to fetch user record after upsert")
 
-            conn.commit()
-            user = cursor.fetchone()
-            cursor.close()
-            conn.close()
-
-            logger.info(f"Created new user: {user_id}")
             return dict(user)
 
         except Exception as e:

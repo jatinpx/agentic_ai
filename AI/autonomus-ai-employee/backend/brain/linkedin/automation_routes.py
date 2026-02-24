@@ -27,6 +27,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/automation", tags=["automation"])
 
 
+def _spawn_background_task(coro, task_name: str) -> None:
+    """Create background task and log failures instead of dropping them silently."""
+    task = asyncio.create_task(coro)
+
+    def _on_done(done_task: asyncio.Task):
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            logger.warning("Background task cancelled: %s", task_name)
+        except Exception as exc:
+            logger.error("Background task failed (%s): %s", task_name, exc, exc_info=True)
+
+    task.add_done_callback(_on_done)
+
+
 # ==================== Request Models ====================
 
 class UserProfileUpdate(BaseModel):
@@ -203,7 +218,10 @@ async def handle_telegram_webhook(body: Dict[str, Any]) -> Dict[str, Any]:
             callback_query_id = body.get("callback_query", {}).get("id")
             if callback_query_id and telegram.bot:
                 try:
-                    await telegram.bot.answer_callback_query(callback_query_id)
+                    await asyncio.wait_for(
+                        telegram.bot.answer_callback_query(callback_query_id),
+                        timeout=3,
+                    )
                 except Exception:
                     pass
 
@@ -222,35 +240,38 @@ async def handle_telegram_webhook(body: Dict[str, Any]) -> Dict[str, Any]:
                 # User finished selecting topics — launch post generation
                 selected_topics = result.get("selected_topics", [])
                 post_config = result.get("post_config", {})
-                asyncio.ensure_future(
+                _spawn_background_task(
                     pipeline.handle_user_topic_selection(
                         user_id=internal_user_id,
                         selected_topic_ids=selected_topics,
                         telegram_chat_id=str(chat_id),
                         post_config=post_config,
-                    )
+                    ),
+                    task_name=f"topic_selection:{internal_user_id}",
                 )
 
             elif result.get("action") == "publish":
                 post_id = result.get("post_id", "")
-                asyncio.ensure_future(
+                _spawn_background_task(
                     pipeline.handle_post_approval(
                         user_id=internal_user_id,
                         thread_id=post_id,
                         approved=True,
                         telegram_chat_id=str(chat_id),
-                    )
+                    ),
+                    task_name=f"approve_post:{internal_user_id}:{post_id}",
                 )
 
             elif result.get("action") == "reject":
                 post_id = result.get("post_id", "")
-                asyncio.ensure_future(
+                _spawn_background_task(
                     pipeline.handle_post_approval(
                         user_id=internal_user_id,
                         thread_id=post_id,
                         approved=False,
                         telegram_chat_id=str(chat_id),
-                    )
+                    ),
+                    task_name=f"reject_post:{internal_user_id}:{post_id}",
                 )
 
             # Log interaction
