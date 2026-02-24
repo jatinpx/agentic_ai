@@ -1,5 +1,7 @@
 from embeddings.embedder import embed_text
-from db.memory_repo import insert_memory, search_memory
+from db.memory_repo import insert_memory, search_memory, list_threads
+def get_threads_paginated(offset=0, limit=20):
+    return list_threads(offset, limit)
 
 
 def store_memory(content: str, mem_type="general", task_id=None):

@@ -50,3 +50,26 @@ def search_memory(embedding, limit=5):
     finally:
         cur.close()
         conn.close()
+
+# Paginated thread/session listing
+def list_threads(offset=0, limit=20):
+    conn = get_conn()
+    cur = conn.cursor()
+    query = """
+        SELECT task_id
+        FROM agent_memory
+        WHERE task_id IS NOT NULL
+        GROUP BY task_id
+        ORDER BY MAX(id) DESC
+        OFFSET %s LIMIT %s
+    """
+    try:
+        cur.execute(query, (offset, limit))
+        rows = cur.fetchall()
+        return [r[0] for r in rows if r[0]]
+    except Exception as e:
+        print(f"❌ SQL Error (list_threads): {e}")
+        return []
+    finally:
+        cur.close()
+        conn.close()

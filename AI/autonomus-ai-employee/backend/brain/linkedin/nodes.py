@@ -70,9 +70,15 @@ def _get_provider() -> str:
     return os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 
 
+def _is_workflow_test_mode() -> bool:
+    """Workflow-only mode: prioritize speed/cost over quality for end-to-end testing."""
+    return os.getenv("WORKFLOW_TEST_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _is_low_cost_mode() -> bool:
     """Reduce paid/free-tier API pressure by skipping non-essential LLM calls."""
-    return os.getenv("LINKEDIN_LOW_COST_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
+    explicit_low_cost = os.getenv("LINKEDIN_LOW_COST_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
+    return explicit_low_cost or _is_workflow_test_mode()
 
 
 def _get_model(node_key: str) -> str:
@@ -84,6 +90,13 @@ def _get_model(node_key: str) -> str:
       Gemini: LINKEDIN_GEMINI_MODEL_{node_key} → GEMINI_MODEL → hardcoded fallback
     """
     provider = _get_provider()
+
+    # Workflow test mode: force cheapest model for all nodes.
+    if _is_workflow_test_mode():
+        override = os.getenv("LINKEDIN_TEST_MODEL", "").strip()
+        if override:
+            return override
+        return "gemini-1.5-flash" if provider == "gemini" else os.getenv("OLLAMA_MODEL_DEFAULT", OLLAMA_DEFAULT)
 
     if provider == "gemini":
         # Check per-node Gemini model first, then global GEMINI_MODEL
@@ -121,10 +134,20 @@ MODEL_SCORER      = lambda: _get_model("SCORER")
 # EMBEDDING QUALITY THRESHOLDS
 # ==========================================
 # Cosine distance caps — lower = stricter match (0 = identical, 1 = opposite)
-STYLE_MAX_DISTANCE = 0.35     # Only very close style matches
-VIRAL_MAX_DISTANCE = 0.40     # Slightly looser for viral templates
-SIMILAR_MAX_DISTANCE = 0.45   # For scorer comparison
-MEMORY_MAX_DISTANCE = 0.40    # For general memory recall
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+STYLE_MAX_DISTANCE = _env_float("STYLE_MAX_DISTANCE", 0.35)     # Only very close style matches
+VIRAL_MAX_DISTANCE = _env_float("VIRAL_MAX_DISTANCE", 0.40)     # Slightly looser for viral templates
+SIMILAR_MAX_DISTANCE = _env_float("SIMILAR_MAX_DISTANCE", 0.45) # For scorer comparison
+MEMORY_MAX_DISTANCE = _env_float("MEMORY_MAX_DISTANCE", 0.40)   # For general memory recall
 MIN_STORE_SCORE = 5.0         # Don't store posts scoring below this
 MIN_RETRIEVAL_SCORE = 5.0     # Don't retrieve low-quality past posts
 

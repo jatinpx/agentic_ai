@@ -46,6 +46,25 @@ interface ConfigurationOptions {
   };
 }
 
+type RawProfile = {
+  name?: unknown;
+  role?: unknown;
+  organization?: unknown;
+  experience_years?: unknown;
+  industries?: unknown;
+  tech_stack?: unknown;
+  identity?: {
+    name?: unknown;
+    job_role?: unknown;
+    organization?: unknown;
+    years_experience?: unknown;
+    industry?: unknown;
+  };
+  technical?: {
+    tech_stack?: unknown;
+  };
+};
+
 interface UserProfile {
   name: string;
   role: string;
@@ -146,7 +165,7 @@ export const LinkedInConfigForm: React.FC<LinkedInConfigFormProps> = ({
     };
 
     fetchConfig();
-  }, [baseUrl]);
+  }, [baseUrl, onError]);
 
   useEffect(() => {
     if (minimized) {
@@ -154,7 +173,7 @@ export const LinkedInConfigForm: React.FC<LinkedInConfigFormProps> = ({
     }
   }, [minimized]);
 
-  const handleInputChange = (field: keyof FormState, value: any) => {
+  const handleInputChange = <K extends keyof FormState>(field: K, value: FormState[K]) => {
     setFormState(prev => ({
       ...prev,
       [field]: value,
@@ -236,9 +255,19 @@ export const LinkedInConfigForm: React.FC<LinkedInConfigFormProps> = ({
     return config?.current_defaults[field];
   };
 
+  const isDefaultField = (field: keyof FormState): field is keyof ConfigurationOptions['current_defaults'] => {
+    return field !== 'topic';
+  };
+
   const getDisplayValue = (field: keyof FormState): string | boolean | undefined => {
     const value = formState[field];
-    return value !== undefined ? value : getDefaultValue(field as any);
+    if (value !== undefined) {
+      return value;
+    }
+    if (isDefaultField(field)) {
+      return getDefaultValue(field);
+    }
+    return undefined;
   };
 
   const getSelectValue = (field: keyof FormState): string => {
@@ -648,24 +677,27 @@ function getFormatLength(format: string): string {
 
 export default LinkedInConfigForm;
 
-function normalizeProfile(rawProfile: any, configProfile?: ConfigurationOptions['user_profile']): UserProfile {
-  const identity = rawProfile?.identity ?? {};
-  const technical = rawProfile?.technical ?? {};
+function normalizeProfile(rawProfile: unknown, configProfile?: ConfigurationOptions['user_profile']): UserProfile {
+  const parsedProfile: RawProfile =
+    rawProfile && typeof rawProfile === 'object' ? (rawProfile as RawProfile) : {};
 
-  const name = rawProfile?.name ?? configProfile?.name ?? identity.name ?? 'Author';
-  const role = rawProfile?.role ?? configProfile?.role ?? identity.job_role ?? 'Tech Professional';
-  const organization = rawProfile?.organization ?? configProfile?.organization ?? identity.organization ?? 'Tech Company';
-  const experienceYears = rawProfile?.experience_years ?? configProfile?.experience_years ?? identity.years_experience ?? 0;
+  const identity = parsedProfile.identity ?? {};
+  const technical = parsedProfile.technical ?? {};
+
+  const name = String(parsedProfile.name ?? configProfile?.name ?? identity.name ?? 'Author');
+  const role = String(parsedProfile.role ?? configProfile?.role ?? identity.job_role ?? 'Tech Professional');
+  const organization = String(parsedProfile.organization ?? configProfile?.organization ?? identity.organization ?? 'Tech Company');
+  const experienceYears = parsedProfile.experience_years ?? configProfile?.experience_years ?? identity.years_experience ?? 0;
 
   const industriesRaw =
-    rawProfile?.industries ??
+    parsedProfile.industries ??
     configProfile?.industries ??
     (typeof identity.industry === 'string' ? identity.industry.split(',') : []);
   const industries = Array.isArray(industriesRaw)
     ? industriesRaw.map((item) => String(item).trim()).filter(Boolean)
     : [];
 
-  const techStackRaw = rawProfile?.tech_stack ?? configProfile?.tech_stack ?? technical.tech_stack ?? [];
+  const techStackRaw = parsedProfile.tech_stack ?? configProfile?.tech_stack ?? technical.tech_stack ?? [];
   const techStack = Array.isArray(techStackRaw)
     ? techStackRaw.map((item) => String(item).trim()).filter(Boolean)
     : [];

@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@fontsource/material-symbols-outlined": "^5.2.36",
+    "dayjs": "^1.11.19",
     "framer-motion": "^11.18.2",
     "next": "16.1.6",
     "react": "19.2.3",

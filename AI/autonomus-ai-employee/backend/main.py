@@ -1,3 +1,5 @@
+from fastapi import Query
+
 import uuid
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -7,6 +9,7 @@ from typing import Optional, List
 import os
 from pathlib import Path
 import re
+import asyncio
 from services.memory_service import store_memory, recall_memory
 from services.langsmith_helper import init_langsmith_tracing
 from utilities.pdf_generation import generate_pdf_report
@@ -15,6 +18,7 @@ from utilities.pdf_generation import generate_pdf_report
 from brain.graph import build_full_agent # Ensure your graph file has this function
 from brain.logger import set_thread_id, clear_thread_id
 from brain.linkedin.routes import router as linkedin_router
+from brain.linkedin.automation_routes import router as automation_router
 
 app = FastAPI()
 
@@ -23,6 +27,8 @@ graph = build_full_agent()
 
 # Include LinkedIn content agent routes
 app.include_router(linkedin_router)
+# Include automation workflow routes
+app.include_router(automation_router)
 
 # ==========================================
 # LINKEDIN OAUTH2 CALLBACK (Handles redirect from LinkedIn)
@@ -82,6 +88,46 @@ async def startup_event():
         print(f"Warning: Could not initialize LinkedIn tables: {e}")
         # Don't crash the app if DB initialization fails
     
+    # Create automation workflow database tables
+    try:
+        import psycopg2
+        from db.migrations.automation_tables import upgrade as migrate_automation
+        
+        connection_string = os.getenv(
+            "DATABASE_URL",
+            "postgresql://postgres:postgres@localhost:5432/ai_employee"
+        )
+        conn = psycopg2.connect(connection_string)
+        migrate_automation(conn)
+        print("[Startup] Automation database tables initialized")
+    except Exception as e:
+        print(f"Warning: Could not initialize automation tables: {e}")
+    
+    # Start the scheduler and schedule daily pipeline
+    try:
+        from services.scheduler_service import get_scheduler, configure_scheduler_logging
+        import logging
+        
+        configure_scheduler_logging(logging.INFO)
+        scheduler = get_scheduler()
+        
+        if not scheduler.is_running:
+            from services.orchestrator import run_daily_automation
+            
+            scheduler.start()
+            print("[Startup] Scheduler started")
+            
+            # Schedule daily pipeline for 8 AM UTC
+            scheduler.schedule_daily_news_pipeline(
+                callback=run_daily_automation,
+                hour=8,
+                minute=0,
+                job_id="daily_news_pipeline",
+            )
+            print("[Startup] Daily news pipeline scheduled for 08:00 UTC")
+    except Exception as e:
+        print(f"Warning: Could not start scheduler: {e}")
+    
     # Store the main event loop for WebSocket broadcasts from background threads
     try:
         import asyncio
@@ -91,6 +137,17 @@ async def startup_event():
         print(f"[Startup] Event loop stored for WebSocket broadcasting")
     except Exception as e:
         print(f"Warning: Could not store event loop: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Gracefully stop the scheduler on app shutdown."""
+    try:
+        from services.scheduler_service import stop_scheduler
+        stop_scheduler()
+        print("[Shutdown] Scheduler stopped")
+    except Exception as e:
+        print(f"Warning: Error stopping scheduler: {e}")
 
 # --- MODELS ---
 class ChatRequest(BaseModel):
@@ -108,6 +165,17 @@ class ReportApprovalRequest(BaseModel):
     approve: bool = True
 
 # --- ENDPOINTS ---
+
+
+# Paginated thread list endpoint
+@app.get("/threads")
+async def get_threads(offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100)):
+    """
+    Returns a paginated list of thread/session IDs (task_id).
+    """
+    from services.memory_service import get_threads_paginated
+    threads = get_threads_paginated(offset=offset, limit=limit)
+    return {"threads": threads, "offset": offset, "limit": limit}
 
 @app.get("/")
 def home():
@@ -136,7 +204,7 @@ async def start_research(req: ChatRequest):
     
     # Run the graph until it hits the interrupt_before=["human_approval"]
     try:
-        graph.invoke(initial_state, config)
+        await asyncio.to_thread(graph.invoke, initial_state, config)
     finally:
         clear_thread_id()
 
@@ -170,7 +238,7 @@ async def approve_research(req: ApprovalRequest):
 
     # resume graph
     try:
-        graph.invoke(None, config)
+        await asyncio.to_thread(graph.invoke, None, config)
     finally:
         clear_thread_id()
 

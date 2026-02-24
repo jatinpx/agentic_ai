@@ -5,6 +5,8 @@ pydantic
 
 # LangGraph agent orchestration
 langgraph
+langchain-ollama
+langchain-huggingface
 
 # LLM providers
 ollama
@@ -20,11 +22,22 @@ numpy
 # Web search
 tavily-python
 duckduckgo-search
+newsapi
+
+# Telegram integration
+python-telegram-bot[all]
+
+# Scheduling
+APScheduler
 
 # PDF reports
 fpdf2
 
 # LinkedIn API (HTTP client)
 httpx
+
 # Configuration
 pyyaml
+
+# HTTP requests (if not already in httpx)
+requests

@@ -242,36 +242,27 @@ def get_top_posts(limit=5, min_score=7.0):
         conn.close()
 
 
-def get_all_posts(limit=50):
+def get_all_posts(limit=50, offset=0):
     """Get all posts ordered by creation date."""
     conn = get_conn()
     cur = conn.cursor()
 
     try:
         cur.execute("""
-            SELECT id, content, hook, cta, hashtags, viral_score,
-                     tone, audience, topic, status, publish_url,
-                   reasoning, created_at
+            SELECT id, viral_score, topic, status, created_at
             FROM linkedin_posts
             ORDER BY created_at DESC
+            OFFSET %s
             LIMIT %s
-        """, (int(limit),))
+        """, (int(offset), int(limit)))
         rows = cur.fetchall()
         return [
             {
                 "id": str(r[0]),
-                "content": r[1],
-                "hook": r[2],
-                "cta": r[3],
-                "hashtags": r[4] or [],
-                "viral_score": float(r[5]) if r[5] else 0.0,
-                "tone": r[6],
-                "audience": r[7],
-                "topic": r[8],
-                "status": r[9],
-                "publish_url": r[10],
-                "reasoning": r[11],
-                "created_at": str(r[12]) if r[12] else None,
+                "viral_score": float(r[1]) if r[1] else 0.0,
+                "topic": r[2],
+                "status": r[3],
+                "created_at": str(r[4]) if r[4] else None,
             }
             for r in rows
         ]
@@ -285,6 +276,11 @@ def get_all_posts(limit=50):
 
 def get_post_by_id(post_id):
     """Get a single post by UUID."""
+    try:
+        normalized_post_id = str(uuid.UUID(str(post_id)))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
     conn = get_conn()
     cur = conn.cursor()
 
@@ -295,7 +291,7 @@ def get_post_by_id(post_id):
                    reasoning, created_at
             FROM linkedin_posts
             WHERE id = %s
-        """, (post_id,))
+                """, (normalized_post_id,))
         r = cur.fetchone()
         if not r:
             return None

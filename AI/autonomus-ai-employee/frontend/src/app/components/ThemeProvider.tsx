@@ -14,14 +14,18 @@ const ThemeContext = createContext<ThemeContextValue | null>(null);
 const THEME_KEY = "agent_theme_mode";
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [theme, setTheme] = useState<ThemeMode>("system");
-
-  useEffect(() => {
-    const stored = window.localStorage.getItem(THEME_KEY) as ThemeMode | null;
-    if (stored) {
-      setTheme(stored);
+  const [theme, setTheme] = useState<ThemeMode>(() => {
+    if (typeof window === "undefined") {
+      return "system";
     }
-  }, []);
+
+    const stored = window.localStorage.getItem(THEME_KEY);
+    if (stored === "light" || stored === "dark" || stored === "sand" || stored === "forest" || stored === "system") {
+      return stored;
+    }
+
+    return "system";
+  });
 
   useEffect(() => {
     const root = document.documentElement;

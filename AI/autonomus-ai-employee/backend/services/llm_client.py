@@ -40,20 +40,29 @@ def _gemini_chat(messages: List[Dict[str, str]], model: Optional[str]) -> str:
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
 
-    model_name = model if model and model.startswith("gemini") else os.getenv(
+    model_name = model if model else os.getenv(
         "GEMINI_MODEL", "gemini-1.5-flash"
     )
 
     contents = []
     for msg in _normalize_messages(messages):
         role = "user" if msg["role"] == "user" else "model"
-        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+        contents.append({
+            "role": role,
+            "parts": [{"text": msg["content"]}]
+        })
 
     payload = {"contents": contents}
     data = json.dumps(payload).encode("utf-8")
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    # 🔥 FIXED ENDPOINT
+    url = f"https://generativelanguage.googleapis.com/v1/models/{model_name}:generateContent?key={api_key}"
+
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"}
+    )
 
     with urllib.request.urlopen(req, timeout=60) as response:
         raw = response.read().decode("utf-8")

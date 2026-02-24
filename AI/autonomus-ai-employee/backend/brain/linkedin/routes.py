@@ -17,6 +17,7 @@ Endpoints:
 """
 
 import uuid
+import asyncio
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, BackgroundTasks
 from typing import Optional, Union
 
@@ -335,8 +336,8 @@ async def approve_post(req: LinkedInApprovalRequest):
                 })
                 raise PipelineAborted("Pipeline aborted during approval processing")
 
-            result = linkedin_graph.invoke(None, config)
-            state_snapshot = linkedin_graph.get_state(config)
+            await asyncio.to_thread(linkedin_graph.invoke, None, config)
+            state_snapshot = await asyncio.to_thread(linkedin_graph.get_state, config)
             
             # Check if we hit another interrupt or completed
             if not state_snapshot.next or state_snapshot.next == ():
@@ -357,7 +358,7 @@ async def approve_post(req: LinkedInApprovalRequest):
         clear_thread_id()
 
     # Get final state
-    new_state = linkedin_graph.get_state(config)
+    new_state = await asyncio.to_thread(linkedin_graph.get_state, config)
     values = new_state.values
     next_node = new_state.next
 
@@ -453,16 +454,16 @@ async def abort_pipeline(req: dict):
 # ==========================================
 
 @router.get("/posts")
-async def list_posts(limit: int = Query(default=50, le=200)):
+async def list_posts(offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=200)):
     """List all generated LinkedIn posts."""
-    posts = get_all_posts(limit=limit)
-    return {"posts": posts, "count": len(posts)}
+    posts = get_all_posts(limit=limit, offset=offset)
+    return {"posts": posts, "count": len(posts), "offset": offset, "limit": limit}
 
 
 @router.get("/posts/{post_id}")
-async def get_post(post_id: str):
+async def get_post(post_id: uuid.UUID):
     """Get a specific LinkedIn post by ID."""
-    post = get_post_by_id(post_id)
+    post = get_post_by_id(str(post_id))
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     return post
